@@ -76,7 +76,28 @@ OPENCODE_API_KEY_ENV=PROVIDER_API_KEY_ENV_NAME
 OPENCODE_MODEL=provider/model-id
 ```
 
-`OPENCODE_API_KEY_ENV` 必须和该 OpenCode provider 读取的环境变量一致。也可以不使用通用的 `API_KEY` alias，而是在 `.env` 里直接写 provider-specific key，例如 `PROVIDER_API_KEY_ENV_NAME=...`。
+供应商名写在 `OPENCODE_MODEL` 第一个 `/` 前面。OpenCode 会把 `provider/model-id` 解析成 `providerID=provider` 和 `modelID=model-id`，然后用 `providerID` 选择供应商。例如，`openai/gpt-5` 会选择 OpenAI provider，`anthropic/claude-sonnet-4-5` 会选择 Anthropic provider，`deepseek/deepseek-v4-flash` 会选择 DeepSeek provider。不要写成 `OPENCODE_MODEL=gpt-5`，除非 `gpt-5` 本身就是 provider id；OpenCode 不会从裸模型名里自动推断 OpenAI。
+
+`OPENCODE_API_KEY_ENV` 不负责选择供应商。它只告诉 harness：启动 OpenCode 前，要把 `API_KEY` 注入到哪个环境变量里。这个变量名必须和该 OpenCode provider 读取的环境变量一致。也可以不使用通用的 `API_KEY` alias，而是在 `.env` 里直接写 provider-specific key，例如 `PROVIDER_API_KEY_ENV_NAME=...`。
+
+常见例子：
+
+```bash
+# DeepSeek
+API_KEY=...
+OPENCODE_API_KEY_ENV=DEEPSEEK_API_KEY
+OPENCODE_MODEL=deepseek/deepseek-v4-flash
+
+# OpenAI
+API_KEY=...
+OPENCODE_API_KEY_ENV=OPENAI_API_KEY
+OPENCODE_MODEL=openai/gpt-5
+
+# Anthropic
+API_KEY=...
+OPENCODE_API_KEY_ENV=ANTHROPIC_API_KEY
+OPENCODE_MODEL=anthropic/claude-sonnet-4-5
+```
 
 准备 OpenCode：
 

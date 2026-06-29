@@ -77,7 +77,28 @@ OPENCODE_API_KEY_ENV=PROVIDER_API_KEY_ENV_NAME
 OPENCODE_MODEL=provider/model-id
 ```
 
-`OPENCODE_API_KEY_ENV` must match the environment variable expected by the OpenCode provider for that model. You can also set that provider-specific key directly in `.env`, for example `PROVIDER_API_KEY_ENV_NAME=...`, instead of using the generic `API_KEY` alias.
+The provider name is the prefix before the first slash in `OPENCODE_MODEL`. OpenCode parses `provider/model-id` into `providerID=provider` and `modelID=model-id`, then uses `providerID` to select the provider. For example, `openai/gpt-5` selects the OpenAI provider, `anthropic/claude-sonnet-4-5` selects the Anthropic provider, and `deepseek/deepseek-v4-flash` selects the DeepSeek provider. Do not set `OPENCODE_MODEL=gpt-5` unless `gpt-5` is itself a provider id; OpenCode does not infer OpenAI from the bare model name.
+
+`OPENCODE_API_KEY_ENV` does not select the provider. It only tells the harness which environment variable should receive `API_KEY` before launching OpenCode. It must match the environment variable expected by the OpenCode provider for that model. You can also set that provider-specific key directly in `.env`, for example `PROVIDER_API_KEY_ENV_NAME=...`, instead of using the generic `API_KEY` alias.
+
+Common examples:
+
+```bash
+# DeepSeek
+API_KEY=...
+OPENCODE_API_KEY_ENV=DEEPSEEK_API_KEY
+OPENCODE_MODEL=deepseek/deepseek-v4-flash
+
+# OpenAI
+API_KEY=...
+OPENCODE_API_KEY_ENV=OPENAI_API_KEY
+OPENCODE_MODEL=openai/gpt-5
+
+# Anthropic
+API_KEY=...
+OPENCODE_API_KEY_ENV=ANTHROPIC_API_KEY
+OPENCODE_MODEL=anthropic/claude-sonnet-4-5
+```
 
 Prepare OpenCode:
 
