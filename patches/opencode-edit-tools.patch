@@ -1,0 +1,3643 @@
+diff --git a/packages/opencode/script/build.ts b/packages/opencode/script/build.ts
+index 236838d..a3dda71 100755
+--- a/packages/opencode/script/build.ts
++++ b/packages/opencode/script/build.ts
+@@ -113,7 +113,12 @@ const allTargets: {
+   },
+ ]
+ 
+-const targets = singleFlag
++const onlyEnv = process.env.OPENCODE_BUILD_ONLY // e.g. "linux-x64" or "linux-x64-baseline"
++const tname = (item: (typeof allTargets)[number]) =>
++  [item.os, item.arch, item.avx2 === false ? "baseline" : undefined, item.abi].filter(Boolean).join("-")
++const targets = onlyEnv
++  ? allTargets.filter((item) => tname(item) === onlyEnv)
++  : singleFlag
+   ? allTargets.filter((item) => {
+       if (item.os !== process.platform || item.arch !== process.arch) {
+         return false
+diff --git a/packages/opencode/src/acp/tool.ts b/packages/opencode/src/acp/tool.ts
+index 309c126..f94b298 100644
+--- a/packages/opencode/src/acp/tool.ts
++++ b/packages/opencode/src/acp/tool.ts
+@@ -48,6 +48,10 @@ export function toToolKind(toolName: string): ToolKind {
+ 
+     case "edit":
+     case "apply_patch":
++    case "apply_unified_patch":
++    case "replace_exact":
++    case "replace_by_anchor":
++    case "insert_by_anchor":
+     case "patch":
+     case "write":
+       return "edit"
+@@ -82,8 +86,11 @@ export function toLocations(toolName: string, input: ToolInput, cwd?: string): T
+ 
+     case "read":
+     case "edit":
++    case "replace_exact":
++    case "replace_by_anchor":
++    case "insert_by_anchor":
+     case "write":
+-      return locationFrom(input.filePath ?? input.filepath)
++      return locationFrom(input.filePath ?? input.filepath ?? input.file)
+ 
+     case "external_directory":
+       return locationFrom(input.filePath ?? input.filepath, input.parentDir, input.directories)
+diff --git a/packages/opencode/src/patch/index.ts b/packages/opencode/src/patch/index.ts
+index 66797d4..be7b8bf 100644
+--- a/packages/opencode/src/patch/index.ts
++++ b/packages/opencode/src/patch/index.ts
+@@ -67,164 +67,302 @@ export enum MaybeApplyPatchVerified {
+ }
+ 
+ // Parser implementation
+-function parsePatchHeader(
+-  lines: string[],
+-  startIdx: number,
+-): { filePath: string; movePath?: string; nextIdx: number } | null {
+-  const line = lines[startIdx]
++const BEGIN_PATCH_MARKER = "*** Begin Patch"
++const END_PATCH_MARKER = "*** End Patch"
++const ADD_FILE_MARKER = "*** Add File:"
++const DELETE_FILE_MARKER = "*** Delete File:"
++const UPDATE_FILE_MARKER = "*** Update File:"
++const MOVE_TO_MARKER = "*** Move to:"
++const EOF_MARKER = "*** End of File"
++const ENVIRONMENT_ID_MARKER = "*** Environment ID:"
++const APPLY_PATCH_COMMANDS = ["apply_patch", "applypatch"] as const
++
++type ParsedHeader =
++  | { type: "add"; filePath: string; nextIdx: number }
++  | { type: "delete"; filePath: string; nextIdx: number }
++  | { type: "update"; filePath: string; movePath?: string; nextIdx: number }
++
++function invalidHunk(lineNumber: number, message: string) {
++  return new Error(`Invalid patch hunk on line ${lineNumber}: ${message}`)
++}
++
++function invalidHeaderMessage(line: string) {
++  return `'${line}' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'`
++}
++
++function isHunkHeader(line: string) {
++  return line.startsWith(ADD_FILE_MARKER) || line.startsWith(DELETE_FILE_MARKER) || line.startsWith(UPDATE_FILE_MARKER)
++}
+ 
+-  if (line.startsWith("*** Add File:")) {
+-    const filePath = line.slice("*** Add File:".length).trim()
+-    return filePath ? { filePath, nextIdx: startIdx + 1 } : null
++function parsePatchHeader(lines: string[], startIdx: number, endIdx: number): ParsedHeader | null {
++  const trimmed = lines[startIdx].trim()
++
++  if (trimmed.startsWith(ADD_FILE_MARKER)) {
++    const filePath = trimmed.slice(ADD_FILE_MARKER.length).trim()
++    return filePath ? { type: "add", filePath, nextIdx: startIdx + 1 } : null
+   }
+ 
+-  if (line.startsWith("*** Delete File:")) {
+-    const filePath = line.slice("*** Delete File:".length).trim()
+-    return filePath ? { filePath, nextIdx: startIdx + 1 } : null
++  if (trimmed.startsWith(DELETE_FILE_MARKER)) {
++    const filePath = trimmed.slice(DELETE_FILE_MARKER.length).trim()
++    return filePath ? { type: "delete", filePath, nextIdx: startIdx + 1 } : null
+   }
+ 
+-  if (line.startsWith("*** Update File:")) {
+-    const filePath = line.slice("*** Update File:".length).trim()
++  if (trimmed.startsWith(UPDATE_FILE_MARKER)) {
++    const filePath = trimmed.slice(UPDATE_FILE_MARKER.length).trim()
+     let movePath: string | undefined
+     let nextIdx = startIdx + 1
+ 
+-    // Check for move directive
+-    if (nextIdx < lines.length && lines[nextIdx].startsWith("*** Move to:")) {
+-      movePath = lines[nextIdx].slice("*** Move to:".length).trim()
++    const maybeMove = nextIdx < endIdx ? lines[nextIdx].trimEnd() : ""
++    if (maybeMove.startsWith(MOVE_TO_MARKER)) {
++      movePath = maybeMove.slice(MOVE_TO_MARKER.length).trim()
+       nextIdx++
+     }
+ 
+-    return filePath ? { filePath, movePath, nextIdx } : null
++    return filePath ? { type: "update", filePath, movePath, nextIdx } : null
+   }
+ 
+   return null
+ }
+ 
+-function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: UpdateFileChunk[]; nextIdx: number } {
+-  const chunks: UpdateFileChunk[] = []
+-  let i = startIdx
++function ensureUpdateHunkNotEmpty(path: string, chunks: UpdateFileChunk[], lineNumber: number) {
++  if (chunks.length === 0) {
++    throw invalidHunk(lineNumber, `Update file hunk for path '${path}' is empty`)
++  }
++  const last = chunks[chunks.length - 1]
++  if (last.old_lines.length === 0 && last.new_lines.length === 0) {
++    throw invalidHunk(lineNumber, "Update hunk does not contain any lines")
++  }
++}
+ 
+-  while (i < lines.length && !lines[i].startsWith("***")) {
+-    if (lines[i].startsWith("@@")) {
+-      // Parse context line
+-      const contextLine = lines[i].substring(2).trim()
+-      i++
++function ensureChunk(chunks: UpdateFileChunk[]) {
++  if (chunks.length === 0) {
++    chunks.push({ old_lines: [], new_lines: [] })
++  }
++  return chunks[chunks.length - 1]
++}
+ 
+-      const oldLines: string[] = []
+-      const newLines: string[] = []
+-      let isEndOfFile = false
++function parseUpdateFileChunks(
++  lines: string[],
++  startIdx: number,
++  endIdx: number,
++  filePath: string,
++): { chunks: UpdateFileChunk[]; nextIdx: number } {
++  const chunks: UpdateFileChunk[] = []
++  let i = startIdx
+ 
+-      // Parse change lines
+-      while (i < lines.length && !lines[i].startsWith("@@") && !lines[i].startsWith("***")) {
+-        const changeLine = lines[i]
++  while (i < endIdx) {
++    const line = lines[i]
++    const updateLine = line.trimEnd()
+ 
+-        if (changeLine === "*** End of File") {
+-          isEndOfFile = true
+-          i++
+-          break
+-        }
++    if (isHunkHeader(updateLine)) break
+ 
+-        if (changeLine.startsWith(" ")) {
+-          // Keep line - appears in both old and new
+-          const content = changeLine.substring(1)
+-          oldLines.push(content)
+-          newLines.push(content)
+-        } else if (changeLine.startsWith("-")) {
+-          // Remove line - only in old
+-          oldLines.push(changeLine.substring(1))
+-        } else if (changeLine.startsWith("+")) {
+-          // Add line - only in new
+-          newLines.push(changeLine.substring(1))
+-        }
+-
+-        i++
++    if (updateLine === "@@" || updateLine.startsWith("@@ ")) {
++      const last = chunks[chunks.length - 1]
++      if (last && last.old_lines.length === 0 && last.new_lines.length === 0) {
++        throw invalidHunk(
++          i + 1,
++          `Unexpected line found in update hunk: '${line}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)`,
++        )
+       }
+-
++      const contextLine = updateLine === "@@" ? undefined : updateLine.slice(3)
+       chunks.push({
+-        old_lines: oldLines,
+-        new_lines: newLines,
++        old_lines: [],
++        new_lines: [],
+         change_context: contextLine || undefined,
+-        is_end_of_file: isEndOfFile || undefined,
+       })
+-    } else {
+       i++
++      continue
++    }
++
++    if (updateLine === EOF_MARKER) {
++      ensureUpdateHunkNotEmpty(filePath, chunks, i + 1)
++      chunks[chunks.length - 1].is_end_of_file = true
++      i++
++      continue
++    }
++
++    if (line === "") {
++      const chunk = ensureChunk(chunks)
++      chunk.old_lines.push("")
++      chunk.new_lines.push("")
++      i++
++      continue
++    }
++
++    if (line.startsWith(" ")) {
++      const chunk = ensureChunk(chunks)
++      const content = line.slice(1)
++      chunk.old_lines.push(content)
++      chunk.new_lines.push(content)
++      i++
++      continue
++    }
++
++    if (line.startsWith("+")) {
++      const chunk = ensureChunk(chunks)
++      chunk.new_lines.push(line.slice(1))
++      i++
++      continue
++    }
++
++    if (line.startsWith("-")) {
++      const chunk = ensureChunk(chunks)
++      chunk.old_lines.push(line.slice(1))
++      i++
++      continue
++    }
++
++    const last = chunks[chunks.length - 1]
++    if (last && (last.old_lines.length > 0 || last.new_lines.length > 0)) {
++      throw invalidHunk(i + 1, `Expected update hunk to start with a @@ context marker, got: '${line}'`)
+     }
++    throw invalidHunk(
++      i + 1,
++      `Unexpected line found in update hunk: '${line}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)`,
++    )
+   }
+ 
++  ensureUpdateHunkNotEmpty(filePath, chunks, startIdx)
+   return { chunks, nextIdx: i }
+ }
+ 
+-function parseAddFileContent(lines: string[], startIdx: number): { content: string; nextIdx: number } {
++function parseAddFileContent(lines: string[], startIdx: number, endIdx: number): { content: string; nextIdx: number } {
+   let content = ""
+   let i = startIdx
+ 
+-  while (i < lines.length && !lines[i].startsWith("***")) {
++  while (i < endIdx) {
++    const trimmed = lines[i].trim()
++    if (isHunkHeader(trimmed)) break
+     if (lines[i].startsWith("+")) {
+-      content += lines[i].substring(1) + "\n"
++      content += lines[i].slice(1) + "\n"
++      i++
++      continue
+     }
+-    i++
+-  }
+-
+-  // Remove trailing newline
+-  if (content.endsWith("\n")) {
+-    content = content.slice(0, -1)
++    throw invalidHunk(i + 1, invalidHeaderMessage(trimmed))
+   }
+ 
+   return { content, nextIdx: i }
+ }
+ 
+ function stripHeredoc(input: string): string {
+-  // Match heredoc patterns like: cat <<'EOF'\n...\nEOF or <<EOF\n...\nEOF
+-  const heredocMatch = input.match(/^(?:cat\s+)?<<['"]?(\w+)['"]?\s*\n([\s\S]*?)\n\1\s*$/)
+-  if (heredocMatch) {
+-    return heredocMatch[2]
++  const lines = input.trim().split("\n")
++  if (lines.length < 4) return input
++  const delimiter = extractHeredocDelimiter(lines[0])
++  if (delimiter && lines[lines.length - 1].endsWith(delimiter)) {
++    return lines.slice(1, -1).join("\n")
+   }
+   return input
+ }
+ 
++function extractHeredocDelimiter(start: string): string | undefined {
++  return start.match(/^<<(?:'([^']+)'|"([^"]+)"|(EOF))$/)?.slice(1).find(Boolean)
++}
++
++function commandName(command: string) {
++  const basename = command.replaceAll("\\", "/").split("/").pop() ?? command
++  const dot = basename.lastIndexOf(".")
++  return (dot > 0 ? basename.slice(0, dot) : basename).toLowerCase()
++}
++
++function isApplyPatchCommand(command: string) {
++  return APPLY_PATCH_COMMANDS.includes(command as (typeof APPLY_PATCH_COMMANDS)[number])
++}
++
++function classifyShell(shell: string, flag: string) {
++  const name = commandName(shell)
++  if ((name === "bash" || name === "zsh" || name === "sh") && (flag === "-lc" || flag === "-c")) return true
++  if ((name === "pwsh" || name === "powershell") && flag.toLowerCase() === "-command") return true
++  if (name === "cmd" && flag.toLowerCase() === "/c") return true
++  return false
++}
++
++function parseShellScript(argv: string[]): string | undefined {
++  if (argv.length === 3 && classifyShell(argv[0], argv[1])) return argv[2]
++  if (
++    argv.length === 4 &&
++    (commandName(argv[0]) === "pwsh" || commandName(argv[0]) === "powershell") &&
++    argv[1].toLowerCase() === "-noprofile" &&
++    classifyShell(argv[0], argv[2])
++  ) {
++    return argv[3]
++  }
++  return undefined
++}
++
++function extractApplyPatchFromShell(script: string): { patch: string; workdir?: string } | undefined {
++  const trimmed = script.trim()
++  const match = trimmed.match(
++    /^(?:cd\s+(?:"([^"]+)"|'([^']+)'|([^&\s]+))\s*&&\s*)?(apply_patch|applypatch)\s*<<(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))\s*\n([\s\S]*)$/,
++  )
++  if (!match) return undefined
++
++  const workdir = match[1] ?? match[2] ?? match[3]
++  const delimiter = match[5] ?? match[6] ?? match[7]
++  const heredoc = match[8].replace(/\r\n/g, "\n").replace(/\r/g, "\n")
++  const lines = heredoc.split("\n")
++  if (lines[lines.length - 1]?.trim() !== delimiter) return undefined
++
++  return {
++    patch: lines.slice(0, -1).join("\n"),
++    workdir,
++  }
++}
++
+ export function parsePatch(patchText: string): { hunks: Hunk[] } {
+-  const cleaned = stripHeredoc(patchText.trim())
++  const cleaned = stripHeredoc(patchText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim())
+   const lines = cleaned.split("\n")
+   const hunks: Hunk[] = []
+-  let i = 0
+-
+-  // Look for Begin/End patch markers
+-  const beginMarker = "*** Begin Patch"
+-  const endMarker = "*** End Patch"
+-
+-  const beginIdx = lines.findIndex((line) => line.trim() === beginMarker)
+-  const endIdx = lines.findIndex((line) => line.trim() === endMarker)
+ 
+-  if (beginIdx === -1 || endIdx === -1 || beginIdx >= endIdx) {
+-    throw new Error("Invalid patch format: missing Begin/End markers")
++  if (lines[0]?.trim() !== BEGIN_PATCH_MARKER) {
++    throw new Error(`Invalid patch format: The first line of the patch must be '${BEGIN_PATCH_MARKER}'`)
++  }
++  if (lines[lines.length - 1]?.trim() !== END_PATCH_MARKER) {
++    throw new Error(`Invalid patch format: The last line of the patch must be '${END_PATCH_MARKER}'`)
+   }
+ 
+-  // Parse content between markers
+-  i = beginIdx + 1
++  let i = 1
++  const endIdx = lines.length - 1
++  let sawEnvironmentID = false
+ 
+   while (i < endIdx) {
+-    const header = parsePatchHeader(lines, i)
+-    if (!header) {
++    const trimmed = lines[i].trim()
++    if (trimmed.startsWith(ENVIRONMENT_ID_MARKER)) {
++      if (sawEnvironmentID) {
++        throw new Error("Invalid patch format: apply_patch environment_id cannot be specified more than once")
++      }
++      if (hunks.length > 0) {
++        throw invalidHunk(i + 1, invalidHeaderMessage(trimmed))
++      }
++      const environmentID = trimmed.slice(ENVIRONMENT_ID_MARKER.length).trim()
++      if (!environmentID) {
++        throw new Error("Invalid patch format: apply_patch environment_id cannot be empty")
++      }
++      sawEnvironmentID = true
+       i++
+       continue
+     }
+ 
+-    if (lines[i].startsWith("*** Add File:")) {
+-      const { content, nextIdx } = parseAddFileContent(lines, header.nextIdx)
++    const header = parsePatchHeader(lines, i, endIdx)
++    if (!header) {
++      throw invalidHunk(i + 1, invalidHeaderMessage(trimmed))
++    }
++
++    if (header.type === "add") {
++      const { content, nextIdx } = parseAddFileContent(lines, header.nextIdx, endIdx)
+       hunks.push({
+         type: "add",
+         path: header.filePath,
+         contents: content,
+       })
+       i = nextIdx
+-    } else if (lines[i].startsWith("*** Delete File:")) {
++    } else if (header.type === "delete") {
+       hunks.push({
+         type: "delete",
+         path: header.filePath,
+       })
+       i = header.nextIdx
+-    } else if (lines[i].startsWith("*** Update File:")) {
+-      const { chunks, nextIdx } = parseUpdateFileChunks(lines, header.nextIdx)
++    } else {
++      const { chunks, nextIdx } = parseUpdateFileChunks(lines, header.nextIdx, endIdx, header.filePath)
+       hunks.push({
+         type: "update",
+         path: header.filePath,
+@@ -232,8 +370,6 @@ export function parsePatch(patchText: string): { hunks: Hunk[] } {
+         chunks,
+       })
+       i = nextIdx
+-    } else {
+-      i++
+     }
+   }
+ 
+@@ -247,10 +383,8 @@ export function maybeParseApplyPatch(
+   | { type: MaybeApplyPatch.Body; args: ApplyPatchArgs }
+   | { type: MaybeApplyPatch.PatchParseError; error: Error }
+   | { type: MaybeApplyPatch.NotApplyPatch } {
+-  const APPLY_PATCH_COMMANDS = ["apply_patch", "applypatch"]
+-
+   // Direct invocation: apply_patch <patch>
+-  if (argv.length === 2 && APPLY_PATCH_COMMANDS.includes(argv[0])) {
++  if (argv.length === 2 && isApplyPatchCommand(argv[0])) {
+     try {
+       const { hunks } = parsePatch(argv[1])
+       return {
+@@ -268,21 +402,18 @@ export function maybeParseApplyPatch(
+     }
+   }
+ 
+-  // Bash heredoc form: bash -lc 'apply_patch <<"EOF" ...'
+-  if (argv.length === 3 && argv[0] === "bash" && argv[1] === "-lc") {
+-    // Simple extraction - in real implementation would need proper bash parsing
+-    const script = argv[2]
+-    const heredocMatch = script.match(/apply_patch\s*<<['"](\w+)['"]\s*\n([\s\S]*?)\n\1/)
+-
+-    if (heredocMatch) {
+-      const patchContent = heredocMatch[2]
++  const script = parseShellScript(argv)
++  if (script) {
++    const invocation = extractApplyPatchFromShell(script)
++    if (invocation) {
+       try {
+-        const { hunks } = parsePatch(patchContent)
++        const { hunks } = parsePatch(invocation.patch)
+         return {
+           type: MaybeApplyPatch.Body,
+           args: {
+-            patch: patchContent,
++            patch: invocation.patch,
+             hunks,
++            workdir: invocation.workdir,
+           },
+         }
+       } catch (error) {
+@@ -588,6 +719,18 @@ export const maybeParseApplyPatchVerified = Effect.fn("Patch.maybeParseApplyPatc
+       // Not a patch, continue
+     }
+   }
++  const shellScript = parseShellScript(argv)
++  if (shellScript) {
++    try {
++      parsePatch(shellScript)
++      return {
++        type: MaybeApplyPatchVerified.CorrectnessError,
++        error: new Error(ApplyPatchError.ImplicitInvocation),
++      } satisfies MaybeApplyPatchVerifiedResult
++    } catch {
++      // Not a raw patch body, continue
++    }
++  }
+ 
+   const result = maybeParseApplyPatch(argv)
+ 
+diff --git a/packages/opencode/src/permission/index.ts b/packages/opencode/src/permission/index.ts
+index e1eb13c..f37dffc 100644
+--- a/packages/opencode/src/permission/index.ts
++++ b/packages/opencode/src/permission/index.ts
+@@ -202,7 +202,17 @@ export function merge(...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule[]
+ }
+ 
+ export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<string> {
+-  const edits = ["edit", "write", "apply_patch"]
++  const edits = [
++    "edit",
++    "write",
++    "apply_patch",
++    "apply_unified_patch",
++    "replace_exact",
++    "replace_by_anchor",
++    "insert_by_anchor",
++    "lsp_symbol",
++    "edit_transaction",
++  ]
+   const reads = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+   return new Set(
+     tools.filter((tool) => {
+diff --git a/packages/opencode/src/tool/apply_patch.txt b/packages/opencode/src/tool/apply_patch.txt
+index 5b2d956..7dba801 100644
+--- a/packages/opencode/src/tool/apply_patch.txt
++++ b/packages/opencode/src/tool/apply_patch.txt
+@@ -1,4 +1,4 @@
+-Use the `apply_patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:
++Use the `apply_patch` tool to edit files. The patch language intentionally matches Codex's `apply_patch` format: a stripped-down, file-oriented diff envelope, not a unified diff. Put the full patch body in `patchText`.
+ 
+ *** Begin Patch
+ [ one or more file sections ]
+@@ -31,3 +31,6 @@ It is important to remember:
+ 
+ - You must include a header with your intended action (Add/Delete/Update)
+ - You must prefix new lines with `+` even when creating a new file
++- You may start an update hunk with `@@` or with the first ` `, `+`, or `-` line directly
++- You may use `*** End of File` after an update hunk to anchor it at the end of the file
++- Do not wrap `patchText` in `cat <<EOF` shell text. If a raw heredoc wrapper is present, only `<<EOF` / `<<'EOF'` / `<<"EOF"` is accepted.
+diff --git a/packages/opencode/src/tool/edit.ts b/packages/opencode/src/tool/edit.ts
+index a92e472..38ac063 100644
+--- a/packages/opencode/src/tool/edit.ts
++++ b/packages/opencode/src/tool/edit.ts
+@@ -85,6 +85,7 @@ export const EditTool = Tool.define(
+           let diff = ""
+           let contentOld = ""
+           let contentNew = ""
++          let result: ReplaceResult | undefined
+           yield* lock(filePath).withPermits(1)(
+             Effect.gen(function* () {
+               if (params.oldString === "") {
+@@ -130,7 +131,8 @@ export const EditTool = Tool.define(
+               const old = convertToLineEnding(normalizeLineEndings(params.oldString), ending)
+               const replacement = convertToLineEnding(normalizeLineEndings(params.newString), ending)
+ 
+-              const next = Bom.split(replace(contentOld, old, replacement, params.replaceAll))
++              result = replaceWithStrategy(contentOld, old, replacement, params.replaceAll)
++              const next = Bom.split(result.content)
+               const desiredBom = source.bom || next.bom
+               contentNew = next.text
+ 
+@@ -189,6 +191,8 @@ export const EditTool = Tool.define(
+             metadata: {
+               diff,
+               filediff,
++              editStrategy: result?.strategy ?? "create",
++              replacements: result?.replacements ?? 0,
+               diagnostics: {},
+             },
+           })
+@@ -205,6 +209,8 @@ export const EditTool = Tool.define(
+               diagnostics,
+               diff,
+               filediff,
++              editStrategy: result?.strategy ?? "create",
++              replacements: result?.replacements ?? 0,
+             },
+             title: `${path.relative(instance.worktree, filePath)}`,
+             output,
+@@ -215,6 +221,25 @@ export const EditTool = Tool.define(
+ )
+ 
+ export type Replacer = (content: string, find: string) => Generator<string, void, unknown>
++export const EditStrategyValues = [
++  "fuzzy",
++  "exact",
++  "line_trimmed",
++  "block_anchor",
++  "whitespace",
++  "indentation",
++  "escape",
++  "trimmed_boundary",
++  "context",
++  "multi_occurrence",
++] as const
++export type EditStrategy = (typeof EditStrategyValues)[number]
++export type ReplaceResult = {
++  content: string
++  strategy: EditStrategy
++  matchedText: string
++  replacements: number
++}
+ 
+ // Similarity thresholds for block anchor fallback matching
+ const SINGLE_CANDIDATE_SIMILARITY_THRESHOLD = 0.65
+@@ -680,6 +705,16 @@ export function trimDiff(diff: string): string {
+ }
+ 
+ export function replace(content: string, oldString: string, newString: string, replaceAll = false): string {
++  return replaceWithStrategy(content, oldString, newString, replaceAll).content
++}
++
++export function replaceWithStrategy(
++  content: string,
++  oldString: string,
++  newString: string,
++  replaceAll = false,
++  strategy = selectedEditStrategy(),
++): ReplaceResult {
+   if (oldString === newString) {
+     throw new Error("No changes to apply: oldString and newString are identical.")
+   }
+@@ -691,17 +726,7 @@ export function replace(content: string, oldString: string, newString: string, r
+ 
+   let notFound = true
+ 
+-  for (const replacer of [
+-    SimpleReplacer,
+-    LineTrimmedReplacer,
+-    BlockAnchorReplacer,
+-    WhitespaceNormalizedReplacer,
+-    IndentationFlexibleReplacer,
+-    EscapeNormalizedReplacer,
+-    TrimmedBoundaryReplacer,
+-    ContextAwareReplacer,
+-    MultiOccurrenceReplacer,
+-  ]) {
++  for (const replacer of replacersForStrategy(strategy)) {
+     for (const search of replacer(content, oldString)) {
+       const index = content.indexOf(search)
+       if (index === -1) continue
+@@ -712,11 +737,21 @@ export function replace(content: string, oldString: string, newString: string, r
+         )
+       }
+       if (replaceAll) {
+-        return content.replaceAll(search, newString)
++        return {
++          content: content.replaceAll(search, newString),
++          strategy,
++          matchedText: search,
++          replacements: countOccurrences(content, search),
++        }
+       }
+       const lastIndex = content.lastIndexOf(search)
+       if (index !== lastIndex) continue
+-      return content.substring(0, index) + newString + content.substring(index + search.length)
++      return {
++        content: content.substring(0, index) + newString + content.substring(index + search.length),
++        strategy,
++        matchedText: search,
++        replacements: 1,
++      }
+     }
+   }
+ 
+@@ -728,6 +763,45 @@ export function replace(content: string, oldString: string, newString: string, r
+   throw new Error("Found multiple matches for oldString. Provide more surrounding context to make the match unique.")
+ }
+ 
++function selectedEditStrategy(): EditStrategy {
++  const value = process.env.OPENCODE_EDIT_STRATEGY
++  if (!value) return "fuzzy"
++  if (isEditStrategy(value)) return value
++  throw new Error(`Invalid OPENCODE_EDIT_STRATEGY: ${value}`)
++}
++
++function isEditStrategy(value: string): value is EditStrategy {
++  return EditStrategyValues.includes(value as EditStrategy)
++}
++
++function replacersForStrategy(strategy: EditStrategy) {
++  if (strategy === "exact") return [SimpleReplacer]
++  if (strategy === "line_trimmed") return [SimpleReplacer, LineTrimmedReplacer]
++  if (strategy === "block_anchor") return [SimpleReplacer, BlockAnchorReplacer]
++  if (strategy === "whitespace") return [SimpleReplacer, WhitespaceNormalizedReplacer]
++  if (strategy === "indentation") return [SimpleReplacer, IndentationFlexibleReplacer]
++  if (strategy === "escape") return [SimpleReplacer, EscapeNormalizedReplacer]
++  if (strategy === "trimmed_boundary") return [SimpleReplacer, TrimmedBoundaryReplacer]
++  if (strategy === "context") return [SimpleReplacer, ContextAwareReplacer]
++  if (strategy === "multi_occurrence") return [SimpleReplacer, MultiOccurrenceReplacer]
++  return [
++    SimpleReplacer,
++    LineTrimmedReplacer,
++    BlockAnchorReplacer,
++    WhitespaceNormalizedReplacer,
++    IndentationFlexibleReplacer,
++    EscapeNormalizedReplacer,
++    TrimmedBoundaryReplacer,
++    ContextAwareReplacer,
++    MultiOccurrenceReplacer,
++  ]
++}
++
++function countOccurrences(content: string, search: string) {
++  if (search === "") return 0
++  return content.split(search).length - 1
++}
++
+ function isDisproportionateMatch(search: string, oldString: string) {
+   const oldLines = oldString.split("\n").length
+   const searchLines = search.split("\n").length
+diff --git a/packages/opencode/src/tool/registry.ts b/packages/opencode/src/tool/registry.ts
+index c098de3..58452b8 100644
+--- a/packages/opencode/src/tool/registry.ts
++++ b/packages/opencode/src/tool/registry.ts
+@@ -29,6 +29,12 @@ import { WebSearchTool } from "./websearch"
+ import { LspTool } from "./lsp"
+ import * as Truncate from "./truncate"
+ import { ApplyPatchTool } from "./apply_patch"
++import { ApplyUnifiedPatchTool } from "./apply_unified_patch"
++import { EditTransactionTool } from "./edit_transaction"
++import { InsertByAnchorTool } from "./insert_by_anchor"
++import { LspSymbolTool } from "./lsp_symbol"
++import { ReplaceByAnchorTool } from "./replace_by_anchor"
++import { ReplaceExactTool } from "./replace_exact"
+ import { Glob } from "@opencode-ai/core/util/glob"
+ import path from "path"
+ import { pathToFileURL } from "url"
+@@ -57,6 +63,41 @@ export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false
+   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
+ }
+ 
++const IndependentEditToolIDs = [
++  ApplyUnifiedPatchTool.id,
++  ReplaceExactTool.id,
++  ReplaceByAnchorTool.id,
++  InsertByAnchorTool.id,
++  LspSymbolTool.id,
++  EditTransactionTool.id,
++] as const
++
++type IndependentEditToolID = (typeof IndependentEditToolIDs)[number]
++
++// "all" / "legacy" toggle every independent edit tool on or off; a "subset"
++// exposes only the listed tools (a single id or a comma-separated combination,
++// e.g. "replace_exact,insert_by_anchor") so benchmark strategies can be pinned.
++type EditToolOverride = { mode: "all" } | { mode: "legacy" } | { mode: "subset"; ids: Set<IndependentEditToolID> }
++
++function editToolOverride(): EditToolOverride | undefined {
++  const value = process.env.OPENCODE_EDIT_TOOL
++  if (!value) return undefined
++  const trimmed = value.trim()
++  if (trimmed === "all") return { mode: "all" }
++  if (trimmed === "legacy") return { mode: "legacy" }
++  const ids = trimmed
++    .split(",")
++    .map((id) => id.trim())
++    .filter(Boolean)
++  if (ids.length === 0) throw new Error(`Invalid OPENCODE_EDIT_TOOL: ${value}`)
++  for (const id of ids) {
++    if (!IndependentEditToolIDs.includes(id as IndependentEditToolID)) {
++      throw new Error(`Invalid OPENCODE_EDIT_TOOL: ${id}`)
++    }
++  }
++  return { mode: "subset", ids: new Set(ids as IndependentEditToolID[]) }
++}
++
+ type TaskDef = Tool.InferDef<typeof TaskTool>
+ type ReadDef = Tool.InferDef<typeof ReadTool>
+ 
+@@ -102,6 +143,12 @@ export const layer = Layer.effect(
+     const globtool = yield* GlobTool
+     const writetool = yield* WriteTool
+     const edit = yield* EditTool
++    const replaceExact = yield* ReplaceExactTool
++    const replaceByAnchor = yield* ReplaceByAnchorTool
++    const insertByAnchor = yield* InsertByAnchorTool
++    const applyUnifiedPatch = yield* ApplyUnifiedPatchTool
++    const lspSymbol = yield* LspSymbolTool
++    const editTransaction = yield* EditTransactionTool
+     const greptool = yield* GrepTool
+     const patchtool = yield* ApplyPatchTool
+     const skilltool = yield* SkillTool
+@@ -202,6 +249,12 @@ export const layer = Layer.effect(
+           glob: Tool.init(globtool),
+           grep: Tool.init(greptool),
+           edit: Tool.init(edit),
++          replaceExact: Tool.init(replaceExact),
++          replaceByAnchor: Tool.init(replaceByAnchor),
++          insertByAnchor: Tool.init(insertByAnchor),
++          applyUnifiedPatch: Tool.init(applyUnifiedPatch),
++          lspSymbol: Tool.init(lspSymbol),
++          editTransaction: Tool.init(editTransaction),
+           write: Tool.init(writetool),
+           task: Tool.init(task),
+           fetch: Tool.init(webfetch),
+@@ -224,6 +277,12 @@ export const layer = Layer.effect(
+             tool.glob,
+             tool.grep,
+             tool.edit,
++            tool.replaceExact,
++            tool.replaceByAnchor,
++            tool.insertByAnchor,
++            tool.applyUnifiedPatch,
++            tool.lspSymbol,
++            tool.editTransaction,
+             tool.write,
+             tool.task,
+             tool.fetch,
+@@ -265,11 +324,25 @@ export const layer = Layer.effect(
+     })
+ 
+     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
++      const selectedEditTool = editToolOverride()
+       const filtered = (yield* all()).filter((tool) => {
+         if (tool.id === WebSearchTool.id) {
+           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
+         }
+ 
++        if (IndependentEditToolIDs.includes(tool.id as IndependentEditToolID)) {
++          if (selectedEditTool?.mode === "legacy") return false
++          if (selectedEditTool?.mode === "subset") return selectedEditTool.ids.has(tool.id as IndependentEditToolID)
++          return true
++        }
++
++        // When a specific subset is pinned, isolate it: keep write as an escape
++        // hatch but drop the legacy edit/apply_patch tools so attribution is clean.
++        if (selectedEditTool?.mode === "subset") {
++          if (tool.id === WriteTool.id) return true
++          if (tool.id === ApplyPatchTool.id || tool.id === EditTool.id) return false
++        }
++
+         const usePatch =
+           input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")
+         if (tool.id === ApplyPatchTool.id) return usePatch
+diff --git a/packages/opencode/test/patch/patch.test.ts b/packages/opencode/test/patch/patch.test.ts
+index c1e47a4..3ba1e7b 100644
+--- a/packages/opencode/test/patch/patch.test.ts
++++ b/packages/opencode/test/patch/patch.test.ts
+@@ -33,7 +33,7 @@ describe("Patch namespace", () => {
+       expect(result.hunks[0]).toEqual({
+         type: "add",
+         path: "test.txt",
+-        contents: "Hello World",
++        contents: "Hello World\n",
+       })
+     })
+ 
+@@ -85,11 +85,94 @@ describe("Patch namespace", () => {
+       }
+     })
+ 
++    test("should parse an update hunk without an explicit context marker", () => {
++      const patchText = `*** Begin Patch
++*** Update File: file.txt
++ import foo
+++import bar
++*** End Patch`
++
++      const result = Patch.parsePatch(patchText)
++      expect(result.hunks).toEqual([
++        {
++          type: "update",
++          path: "file.txt",
++          chunks: [
++            {
++              old_lines: ["import foo"],
++              new_lines: ["import foo", "import bar"],
++            },
++          ],
++        },
++      ])
++    })
++
+     test("should throw error for invalid patch format", () => {
+       const invalidPatch = `This is not a valid patch`
+ 
+       expect(() => Patch.parsePatch(invalidPatch)).toThrow("Invalid patch format")
+     })
++
++    test("should require begin and end markers to bound the patch", () => {
++      const extraPrefix = `echo nope
++*** Begin Patch
++*** Add File: test.txt
+++Content
++*** End Patch`
++
++      const extraSuffix = `*** Begin Patch
++*** Add File: test.txt
+++Content
++*** End Patch
++echo nope`
++
++      expect(() => Patch.parsePatch(extraPrefix)).toThrow("The first line of the patch must be")
++      expect(() => Patch.parsePatch(extraSuffix)).toThrow("The last line of the patch must be")
++    })
++
++    test("should reject empty update hunks and invalid update lines", () => {
++      expect(() =>
++        Patch.parsePatch(`*** Begin Patch
++*** Update File: file.txt
++*** End Patch`),
++      ).toThrow("Update file hunk for path 'file.txt' is empty")
++
++      expect(() =>
++        Patch.parsePatch(`*** Begin Patch
++*** Update File: file.txt
++@@
++plain text
++*** End Patch`),
++      ).toThrow("Every line should start with")
++    })
++
++    test("should parse a raw heredoc wrapped patch argument", () => {
++      const patchText = `<<'EOF'
++*** Begin Patch
++*** Add File: test.txt
+++Content
++*** End Patch
++EOF`
++
++      const result = Patch.parsePatch(patchText)
++      expect(result.hunks).toHaveLength(1)
++      expect(result.hunks[0]).toEqual({
++        type: "add",
++        path: "test.txt",
++        contents: "Content\n",
++      })
++    })
++
++    test("should not strip cat heredocs as patch text", () => {
++      const patchText = `cat <<'EOF'
++*** Begin Patch
++*** Add File: test.txt
+++Content
++*** End Patch
++EOF`
++
++      expect(() => Patch.parsePatch(patchText)).toThrow("The first line of the patch must be")
++    })
+   })
+ 
+   describe("maybeParseApplyPatch", () => {
+@@ -132,6 +215,34 @@ PATCH`
+       }
+     })
+ 
++    test("should handle bash heredoc format with cd workdir", () => {
++      const script = `cd src && apply_patch <<'PATCH'
++*** Begin Patch
++*** Add File: test.txt
+++Content
++*** End Patch
++PATCH`
++
++      const result = Patch.maybeParseApplyPatch(["bash", "-lc", script])
++      expect(result.type).toBe(Patch.MaybeApplyPatch.Body)
++      if (result.type === Patch.MaybeApplyPatch.Body) {
++        expect(result.args.workdir).toBe("src")
++        expect(result.args.hunks).toHaveLength(1)
++      }
++    })
++
++    test("should not parse shell scripts with surrounding commands", () => {
++      const script = `echo before && apply_patch <<'PATCH'
++*** Begin Patch
++*** Add File: test.txt
+++Content
++*** End Patch
++PATCH`
++
++      const result = Patch.maybeParseApplyPatch(["bash", "-lc", script])
++      expect(result.type).toBe(Patch.MaybeApplyPatch.NotApplyPatch)
++    })
++
+     test("should return NotApplyPatch for non-patch commands", () => {
+       const result = Patch.maybeParseApplyPatch(["echo", "hello"])
+       expect(result.type).toBe(Patch.MaybeApplyPatch.NotApplyPatch)
+@@ -153,7 +264,7 @@ PATCH`
+         expect(result.deleted).toHaveLength(0)
+ 
+         const content = yield* Effect.promise(() => fs.readFile(result.added[0], "utf-8"))
+-        expect(content).toBe("Hello World\nThis is a new file")
++        expect(content).toBe("Hello World\nThis is a new file\n")
+       }),
+     )
+ 
+diff --git a/packages/opencode/test/tool/__snapshots__/parameters.test.ts.snap b/packages/opencode/test/tool/__snapshots__/parameters.test.ts.snap
+index 51ff867..d625a5e 100644
+--- a/packages/opencode/test/tool/__snapshots__/parameters.test.ts.snap
++++ b/packages/opencode/test/tool/__snapshots__/parameters.test.ts.snap
+@@ -464,3 +464,291 @@ exports[`tool parameters JSON Schema (wire shape) write 1`] = `
+   "type": "object",
+ }
+ `;
++
++exports[`tool parameters JSON Schema (wire shape) apply_unified_patch 1`] = `
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "properties": {
++    "allow_fuzz": {
++      "description": "Allow fuzzy hunk matching. Defaults to false.",
++      "type": "boolean",
++    },
++    "expected_files": {
++      "additionalProperties": {
++        "type": "string",
++      },
++      "description": "Optional map of file path to expected current sha256.",
++      "type": "object",
++    },
++    "patch": {
++      "description": "A standard unified diff patch.",
++      "type": "string",
++    },
++  },
++  "required": [
++    "patch",
++  ],
++  "type": "object",
++}
++`;
++
++exports[`tool parameters JSON Schema (wire shape) insert_by_anchor 1`] = `
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "properties": {
++    "anchor": {
++      "description": "Literal anchor text.",
++      "type": "string",
++    },
++    "content": {
++      "description": "Text to insert.",
++      "type": "string",
++    },
++    "expected_matches": {
++      "description": "Expected anchor occurrence count. Defaults to 1.",
++      "type": "number",
++    },
++    "expected_sha256": {
++      "description": "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++      "type": "string",
++    },
++    "file": {
++      "description": "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace.",
++      "type": "string",
++    },
++    "max_insert_lines": {
++      "description": "Maximum inserted lines. Defaults to 200.",
++      "type": "number",
++    },
++    "must_not_already_contain": {
++      "description": "Optional duplicate guard. If the file already contains this text, the edit is rejected.",
++      "type": "string",
++    },
++    "position": {
++      "description": "Insert before or after the anchor.",
++      "enum": [
++        "before",
++        "after",
++      ],
++      "type": "string",
++    },
++  },
++  "required": [
++    "file",
++    "anchor",
++    "position",
++    "content",
++  ],
++  "type": "object",
++}
++`;
++
++exports[`tool parameters JSON Schema (wire shape) replace_by_anchor 1`] = `
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "properties": {
++    "end_anchor": {
++      "description": "Literal text marking the end of the target range.",
++      "type": "string",
++    },
++    "expected_matches": {
++      "description": "Expected number of matching ranges. Defaults to 1.",
++      "type": "number",
++    },
++    "expected_sha256": {
++      "description": "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++      "type": "string",
++    },
++    "file": {
++      "description": "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace.",
++      "type": "string",
++    },
++    "include_end": {
++      "description": "Whether to replace the end anchor itself. Defaults to true.",
++      "type": "boolean",
++    },
++    "include_start": {
++      "description": "Whether to replace the start anchor itself. Defaults to true.",
++      "type": "boolean",
++    },
++    "max_target_lines": {
++      "description": "Maximum target range size in lines. Defaults to 200.",
++      "type": "number",
++    },
++    "new": {
++      "description": "Replacement text for the selected range.",
++      "type": "string",
++    },
++    "start_anchor": {
++      "description": "Literal text marking the start of the target range.",
++      "type": "string",
++    },
++  },
++  "required": [
++    "file",
++    "start_anchor",
++    "end_anchor",
++    "new",
++  ],
++  "type": "object",
++}
++`;
++
++exports[`tool parameters JSON Schema (wire shape) replace_exact 1`] = `
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "properties": {
++    "expected_occurrences": {
++      "description": "How many times old must occur. Defaults to 1.",
++      "type": "number",
++    },
++    "expected_sha256": {
++      "description": "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++      "type": "string",
++    },
++    "file": {
++      "description": "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace.",
++      "type": "string",
++    },
++    "new": {
++      "description": "Replacement text.",
++      "type": "string",
++    },
++    "old": {
++      "description": "Exact text to replace.",
++      "type": "string",
++    },
++    "replace_all": {
++      "description": "Replace all expected occurrences. Defaults to false; when false expected_occurrences must be 1.",
++      "type": "boolean",
++    },
++  },
++  "required": [
++    "file",
++    "old",
++    "new",
++  ],
++  "type": "object",
++}
++`;
++
++exports[`tool parameters JSON Schema (wire shape) replace_symbol_body 1`] = `
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "properties": {
++    "expected_sha256": {
++      "description": "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++      "type": "string",
++    },
++    "file": {
++      "description": "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace.",
++      "type": "string",
++    },
++    "language": {
++      "description": "Parser language. This tool currently supports TypeScript and JavaScript.",
++      "enum": [
++        "typescript",
++        "javascript",
++      ],
++      "type": "string",
++    },
++    "new_body": {
++      "description": "Replacement body, including the surrounding braces.",
++      "type": "string",
++    },
++    "symbol": {
++      "properties": {
++        "class": {
++          "description": "Containing class name for method symbols.",
++          "type": "string",
++        },
++        "kind": {
++          "enum": [
++            "function",
++            "method",
++            "class",
++            "test_case",
++          ],
++          "type": "string",
++        },
++        "name": {
++          "description": "Symbol name. For test_case, use the test title string.",
++          "type": "string",
++        },
++      },
++      "required": [
++        "kind",
++        "name",
++      ],
++      "type": "object",
++    },
++  },
++  "required": [
++    "file",
++    "language",
++    "symbol",
++    "new_body",
++  ],
++  "type": "object",
++}
++`;
++
++exports[`tool parameters JSON Schema (wire shape) structured_data_edit 1`] = `
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "properties": {
++    "expected_sha256": {
++      "description": "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++      "type": "string",
++    },
++    "file": {
++      "description": "The structured data file to edit.",
++      "type": "string",
++    },
++    "format": {
++      "description": "Data format. Currently json/jsonc are parser-backed; yaml/toml are rejected explicitly.",
++      "enum": [
++        "json",
++        "jsonc",
++        "yaml",
++        "toml",
++      ],
++      "type": "string",
++    },
++    "operations": {
++      "description": "Structured path operations to apply in order.",
++      "items": {
++        "properties": {
++          "op": {
++            "enum": [
++              "set",
++              "add",
++              "remove",
++            ],
++            "type": "string",
++          },
++          "path": {
++            "description": "Path like $.scripts.test or jobs.test.steps[1].run.",
++            "type": "string",
++          },
++          "value": {
++            "description": "Value for set/add operations.",
++          },
++        },
++        "required": [
++          "op",
++          "path",
++        ],
++        "type": "object",
++      },
++      "type": "array",
++    },
++  },
++  "required": [
++    "file",
++    "format",
++    "operations",
++  ],
++  "type": "object",
++}
++`;
+diff --git a/packages/opencode/test/tool/apply_patch.test.ts b/packages/opencode/test/tool/apply_patch.test.ts
+index 01a09ad..26b1b34 100644
+--- a/packages/opencode/test/tool/apply_patch.test.ts
++++ b/packages/opencode/test/tool/apply_patch.test.ts
+@@ -244,6 +244,20 @@ describe("tool.apply_patch freeform", () => {
+     }),
+   )
+ 
++  it.instance("updates file without an explicit initial @@ context marker", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const { ctx } = makeCtx()
++      const target = path.join(test.directory, "implicit_context.txt")
++      yield* writeText(target, "import foo\n")
++
++      const patchText = "*** Begin Patch\n*** Update File: implicit_context.txt\n import foo\n+import bar\n*** End Patch"
++
++      yield* execute({ patchText }, ctx)
++      expect(yield* readText(target)).toBe("import foo\nimport bar\n")
++    }),
++  )
++
+   it.instance("appends trailing newline on update", () =>
+     Effect.gen(function* () {
+       const test = yield* TestInstance
+@@ -385,6 +399,20 @@ describe("tool.apply_patch freeform", () => {
+     }),
+   )
+ 
++  it.instance("rejects empty update hunk", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const { ctx } = makeCtx()
++      const target = path.join(test.directory, "empty_update.txt")
++      yield* writeText(target, "stable\n")
++
++      const patchText = "*** Begin Patch\n*** Update File: empty_update.txt\n*** End Patch"
++
++      yield* expectFailure(execute({ patchText }, ctx), "Update file hunk for path 'empty_update.txt' is empty")
++      expect(yield* readText(target)).toBe("stable\n")
++    }),
++  )
++
+   it.instance("supports end of file anchor", () =>
+     Effect.gen(function* () {
+       const test = yield* TestInstance
+@@ -445,9 +473,8 @@ describe("tool.apply_patch freeform", () => {
+     }),
+   )
+ 
+-  it.instance("parses heredoc-wrapped patch", () =>
++  it.instance("rejects cat heredoc-wrapped patch text", () =>
+     Effect.gen(function* () {
+-      const test = yield* TestInstance
+       const { ctx } = makeCtx()
+       const patchText = `cat <<'EOF'
+ *** Begin Patch
+@@ -456,12 +483,11 @@ describe("tool.apply_patch freeform", () => {
+ *** End Patch
+ EOF`
+ 
+-      yield* execute({ patchText }, ctx)
+-      expect(yield* readText(path.join(test.directory, "heredoc_test.txt"))).toBe("heredoc content\n")
++      yield* expectFailure(execute({ patchText }, ctx), "The first line of the patch must be")
+     }),
+   )
+ 
+-  it.instance("parses heredoc-wrapped patch without cat", () =>
++  it.instance("parses raw heredoc-wrapped patch argument", () =>
+     Effect.gen(function* () {
+       const test = yield* TestInstance
+       const { ctx } = makeCtx()
+diff --git a/packages/opencode/test/tool/edit.test.ts b/packages/opencode/test/tool/edit.test.ts
+index 12db535..8741223 100644
+--- a/packages/opencode/test/tool/edit.test.ts
++++ b/packages/opencode/test/tool/edit.test.ts
+@@ -2,7 +2,7 @@ import { afterEach, describe, expect } from "bun:test"
+ import path from "path"
+ import fs from "fs/promises"
+ import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+-import { EditTool } from "../../src/tool/edit"
++import { EditTool, replaceWithStrategy } from "../../src/tool/edit"
+ import { disposeAllInstances, TestInstance } from "../fixture/fixture"
+ import { LSP } from "@/lsp/lsp"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+@@ -94,6 +94,45 @@ const onceBus = Effect.fn("EditToolTest.onceBus")(function* (def: typeof Watcher
+ })
+ 
+ describe("tool.edit", () => {
++  describe("edit strategies", () => {
++    it.effect("exact strategy rejects non-exact matches", () =>
++      Effect.gen(function* () {
++        expect(() =>
++          replaceWithStrategy("function demo() {\n  return 1\n}\n", "function demo(){\nreturn 1\n}", "x", false, "exact"),
++        ).toThrow("Could not find oldString")
++      }),
++    )
++
++    it.effect("line_trimmed strategy handles indentation-only drift", () =>
++      Effect.gen(function* () {
++        const result = replaceWithStrategy(
++          "function demo() {\n  return 1\n}\n",
++          "function demo() {\nreturn 1\n}",
++          "function demo() {\n  return 2\n}",
++          false,
++          "line_trimmed",
++        )
++
++        expect(result.content).toBe("function demo() {\n  return 2\n}\n")
++        expect(result.strategy).toBe("line_trimmed")
++      }),
++    )
++
++    it.effect("fuzzy strategy keeps the current fallback behavior", () =>
++      Effect.gen(function* () {
++        const result = replaceWithStrategy(
++          "function demo() {\n  return 1\n}\n",
++          "function demo() {\nreturn 1\n}",
++          "function demo() {\n  return 2\n}",
++          false,
++          "fuzzy",
++        )
++
++        expect(result.content).toBe("function demo() {\n  return 2\n}\n")
++      }),
++    )
++  })
++
+   describe("creating new files", () => {
+     it.instance("creates new file when oldString is empty", () =>
+       Effect.gen(function* () {
+@@ -155,10 +194,35 @@ describe("tool.edit", () => {
+         const result = yield* run({ filePath: filepath, oldString: "old content", newString: "new content" })
+ 
+         expect(result.output).toContain("Edit applied successfully")
++        expect(result.metadata.editStrategy).toBe("fuzzy")
++        expect(result.metadata.replacements).toBe(1)
+         expect(yield* load(filepath)).toBe("new content here")
+       }),
+     )
+ 
++    it.instance("uses OPENCODE_EDIT_STRATEGY to select the edit engine", () =>
++      Effect.gen(function* () {
++        const test = yield* TestInstance
++        const filepath = path.join(test.directory, "file.ts")
++        yield* put(filepath, "function demo() {\n  return 1\n}\n")
++        const previous = process.env.OPENCODE_EDIT_STRATEGY
++        process.env.OPENCODE_EDIT_STRATEGY = "exact"
++
++        try {
++          const error = yield* fail({
++            filePath: filepath,
++            oldString: "function demo() {\nreturn 1\n}",
++            newString: "function demo() {\n  return 2\n}",
++          })
++          expect(error.message).toContain("Could not find oldString")
++        } finally {
++          if (previous === undefined) delete process.env.OPENCODE_EDIT_STRATEGY
++          else process.env.OPENCODE_EDIT_STRATEGY = previous
++        }
++        expect(yield* load(filepath)).toBe("function demo() {\n  return 1\n}\n")
++      }),
++    )
++
+     it.instance("replaces the first visible line in BOM files", () =>
+       Effect.gen(function* () {
+         const test = yield* TestInstance
+diff --git a/packages/opencode/test/tool/parameters.test.ts b/packages/opencode/test/tool/parameters.test.ts
+index 9c540da..1771b0e 100644
+--- a/packages/opencode/test/tool/parameters.test.ts
++++ b/packages/opencode/test/tool/parameters.test.ts
+@@ -10,14 +10,18 @@ import { ToolJsonSchema } from "../../src/tool/json-schema"
+ // provider-compatible while tools use Effect Schema internally.
+ 
+ import { Parameters as ApplyPatch } from "../../src/tool/apply_patch"
++import { Parameters as ApplyUnifiedPatch } from "../../src/tool/apply_unified_patch"
+ import { Parameters as Edit } from "../../src/tool/edit"
+ import { Parameters as Glob } from "../../src/tool/glob"
+ import { Parameters as Grep } from "../../src/tool/grep"
++import { Parameters as InsertByAnchor } from "../../src/tool/insert_by_anchor"
+ import { Parameters as Invalid } from "../../src/tool/invalid"
+ import { Parameters as Lsp } from "../../src/tool/lsp"
+ import { Parameters as Plan } from "../../src/tool/plan"
+ import { Parameters as Question } from "../../src/tool/question"
+ import { Parameters as Read } from "../../src/tool/read"
++import { Parameters as ReplaceByAnchor } from "../../src/tool/replace_by_anchor"
++import { Parameters as ReplaceExact } from "../../src/tool/replace_exact"
+ import { Parameters as Shell } from "../../src/tool/shell"
+ import { Parameters as Skill } from "../../src/tool/skill"
+ import { Parameters as Task } from "../../src/tool/task"
+@@ -37,15 +41,19 @@ const toJsonSchema = ToolJsonSchema.fromSchema
+ describe("tool parameters", () => {
+   describe("JSON Schema (wire shape)", () => {
+     test("apply_patch", () => expect(toJsonSchema(ApplyPatch)).toMatchSnapshot())
++    test("apply_unified_patch", () => expect(toJsonSchema(ApplyUnifiedPatch)).toMatchSnapshot())
+     test("bash", () => expect(toJsonSchema(Shell)).toMatchSnapshot())
+     test("edit", () => expect(toJsonSchema(Edit)).toMatchSnapshot())
+     test("glob", () => expect(toJsonSchema(Glob)).toMatchSnapshot())
+     test("grep", () => expect(toJsonSchema(Grep)).toMatchSnapshot())
++    test("insert_by_anchor", () => expect(toJsonSchema(InsertByAnchor)).toMatchSnapshot())
+     test("invalid", () => expect(toJsonSchema(Invalid)).toMatchSnapshot())
+     test("lsp", () => expect(toJsonSchema(Lsp)).toMatchSnapshot())
+     test("plan", () => expect(toJsonSchema(Plan)).toMatchSnapshot())
+     test("question", () => expect(toJsonSchema(Question)).toMatchSnapshot())
+     test("read", () => expect(toJsonSchema(Read)).toMatchSnapshot())
++    test("replace_by_anchor", () => expect(toJsonSchema(ReplaceByAnchor)).toMatchSnapshot())
++    test("replace_exact", () => expect(toJsonSchema(ReplaceExact)).toMatchSnapshot())
+     test("skill", () => expect(toJsonSchema(Skill)).toMatchSnapshot())
+     test("task", () => expect(toJsonSchema(Task)).toMatchSnapshot())
+     test("todo", () => expect(toJsonSchema(Todo)).toMatchSnapshot())
+@@ -105,6 +113,18 @@ describe("tool parameters", () => {
+     })
+   })
+ 
++  describe("apply_unified_patch", () => {
++    test("accepts patch with expected files", () => {
++      expect(parse(ApplyUnifiedPatch, { patch: "--- a/a\n+++ b/a\n", expected_files: { a: "abc" } })).toEqual({
++        patch: "--- a/a\n+++ b/a\n",
++        expected_files: { a: "abc" },
++      })
++    })
++    test("rejects missing patch", () => {
++      expect(accepts(ApplyUnifiedPatch, {})).toBe(false)
++    })
++  })
++
+   describe("shell", () => {
+     test("accepts command", () => {
+       expect(parse(Shell, { command: "ls" })).toEqual({ command: "ls" })
+@@ -137,6 +157,44 @@ describe("tool parameters", () => {
+     })
+   })
+ 
++  describe("replace_exact", () => {
++    test("accepts required fields", () => {
++      expect(parse(ReplaceExact, { file: "/a", old: "x", new: "y" })).toMatchObject({
++        file: "/a",
++        old: "x",
++        new: "y",
++      })
++    })
++    test("rejects missing old", () => {
++      expect(accepts(ReplaceExact, { file: "/a", new: "y" })).toBe(false)
++    })
++  })
++
++  describe("replace_by_anchor", () => {
++    test("accepts anchors and replacement", () => {
++      expect(parse(ReplaceByAnchor, { file: "/a", start_anchor: "a", end_anchor: "b", new: "x" })).toMatchObject({
++        file: "/a",
++        start_anchor: "a",
++        end_anchor: "b",
++        new: "x",
++      })
++    })
++    test("rejects missing anchors", () => {
++      expect(accepts(ReplaceByAnchor, { file: "/a", new: "x" })).toBe(false)
++    })
++  })
++
++  describe("insert_by_anchor", () => {
++    test("accepts before/after position", () => {
++      expect(parse(InsertByAnchor, { file: "/a", anchor: "a", position: "after", content: "x" }).position).toBe(
++        "after",
++      )
++    })
++    test("rejects invalid position", () => {
++      expect(accepts(InsertByAnchor, { file: "/a", anchor: "a", position: "middle", content: "x" })).toBe(false)
++    })
++  })
++
+   describe("glob", () => {
+     test("accepts pattern-only", () => {
+       expect(parse(Glob, { pattern: "**/*.ts" })).toEqual({ pattern: "**/*.ts" })
+diff --git a/packages/opencode/test/tool/registry.test.ts b/packages/opencode/test/tool/registry.test.ts
+index b32a48e..ba92aa3 100644
+--- a/packages/opencode/test/tool/registry.test.ts
++++ b/packages/opencode/test/tool/registry.test.ts
+@@ -99,6 +99,89 @@ describe("tool.registry", () => {
+     }),
+   )
+ 
++  it.instance("can expose one independent edit tool for benchmark runs", () =>
++    Effect.gen(function* () {
++      const previous = process.env.OPENCODE_EDIT_TOOL
++      process.env.OPENCODE_EDIT_TOOL = "replace_exact"
++      try {
++        const registry = yield* ToolRegistry.Service
++        const agent = yield* Agent.Service
++        const build = yield* agent.get("build")
++        if (!build) throw new Error("build agent not found")
++        const ids = (yield* registry.tools({
++          providerID: ProviderV2.ID.opencode,
++          modelID: ModelV2.ID.make("test"),
++          agent: build,
++        })).map((tool) => tool.id)
++
++        expect(ids).toContain("replace_exact")
++        expect(ids).toContain("write")
++        expect(ids).not.toContain("edit")
++        expect(ids).not.toContain("apply_patch")
++        expect(ids).not.toContain("replace_by_anchor")
++      } finally {
++        if (previous === undefined) delete process.env.OPENCODE_EDIT_TOOL
++        else process.env.OPENCODE_EDIT_TOOL = previous
++      }
++    }),
++  )
++
++  it.instance("registers the new edit tools by default and hides them in legacy mode", () =>
++    Effect.gen(function* () {
++      const registry = yield* ToolRegistry.Service
++      const agent = yield* Agent.Service
++      const build = yield* agent.get("build")
++      if (!build) throw new Error("build agent not found")
++      const model = { providerID: ProviderV2.ID.opencode, modelID: ModelV2.ID.make("test"), agent: build }
++
++      const ids = (yield* registry.tools(model)).map((tool) => tool.id)
++      expect(ids).toContain("replace_exact")
++      expect(ids).toContain("replace_by_anchor")
++      expect(ids).toContain("apply_unified_patch")
++
++      const previous = process.env.OPENCODE_EDIT_TOOL
++      process.env.OPENCODE_EDIT_TOOL = "legacy"
++      try {
++        const legacyIds = (yield* registry.tools(model)).map((tool) => tool.id)
++        expect(legacyIds).not.toContain("replace_exact")
++        expect(legacyIds).not.toContain("replace_by_anchor")
++        expect(legacyIds).not.toContain("apply_unified_patch")
++        expect(legacyIds).toContain("edit")
++      } finally {
++        if (previous === undefined) delete process.env.OPENCODE_EDIT_TOOL
++        else process.env.OPENCODE_EDIT_TOOL = previous
++      }
++    }),
++  )
++
++  it.instance("can expose a combination of independent edit tools for strategy runs", () =>
++    Effect.gen(function* () {
++      const previous = process.env.OPENCODE_EDIT_TOOL
++      process.env.OPENCODE_EDIT_TOOL = "replace_exact,insert_by_anchor"
++      try {
++        const registry = yield* ToolRegistry.Service
++        const agent = yield* Agent.Service
++        const build = yield* agent.get("build")
++        if (!build) throw new Error("build agent not found")
++        const ids = (yield* registry.tools({
++          providerID: ProviderV2.ID.opencode,
++          modelID: ModelV2.ID.make("test"),
++          agent: build,
++        })).map((tool) => tool.id)
++
++        expect(ids).toContain("replace_exact")
++        expect(ids).toContain("insert_by_anchor")
++        expect(ids).toContain("write")
++        expect(ids).not.toContain("replace_by_anchor")
++        expect(ids).not.toContain("edit")
++        expect(ids).not.toContain("apply_patch")
++      } finally {
++        if (previous === undefined) delete process.env.OPENCODE_EDIT_TOOL
++        else process.env.OPENCODE_EDIT_TOOL = previous
++      }
++    }),
++  )
++
+   it.instance("loads tools from .opencode/tool (singular)", () =>
+     Effect.gen(function* () {
+       const test = yield* TestInstance
+diff --git a/packages/opencode/EDIT_STRATEGY_BENCHMARK.md b/packages/opencode/EDIT_STRATEGY_BENCHMARK.md
+new file mode 100644
+index 0000000..48049a4
+--- /dev/null
++++ b/packages/opencode/EDIT_STRATEGY_BENCHMARK.md
+@@ -0,0 +1,115 @@
++# Edit Tool Benchmark Notes
++
++This branch has two benchmark surfaces:
++
++1. The original OpenCode `edit` tool with swappable internal matching strategies.
++2. Independent edit tools with distinct model-facing schemas.
++
++`write` is intentionally unchanged.
++
++## Independent Tools
++
++The independently exposed tools are:
++
++- `apply_unified_patch`: standard unified diff, pre-verifies every file, writes atomically after permission.
++- `replace_exact`: exact text replacement with occurrence and optional sha256 checks.
++- `replace_by_anchor`: literal start/end anchor range replacement with uniqueness and max-range checks.
++- `insert_by_anchor`: literal anchor insertion with uniqueness and duplicate-guard checks.
++- `replace_symbol_body`: TypeScript/JavaScript parser-backed symbol body replacement.
++- `structured_data_edit`: JSON/JSONC parser-backed path operations.
++
++All successful independent tools return benchmark-friendly metadata:
++
++- `ok`
++- `tool`
++- `files_changed`
++- `changed_lines`
++- `diff`
++- `warnings`
++- `requires_reread`
++- `postcheck`
++
++Known first-pass boundaries:
++
++- `structured_data_edit` rejects YAML/TOML with `UNSUPPORTED_FORMAT` until parser-backed implementations are added.
++- `replace_symbol_body` supports TypeScript/JavaScript only; Python/Go are intentionally not guessed with text heuristics.
++
++To run one independent edit tool at a time, set `OPENCODE_EDIT_TOOL`:
++
++```bash
++for tool in apply_unified_patch replace_exact replace_by_anchor insert_by_anchor replace_symbol_body structured_data_edit; do
++  OPENCODE_EDIT_TOOL="$tool" \
++    <swe-bench-pro-runner-command> \
++    --output "runs/swebench-pro-$tool.jsonl"
++done
++```
++
++Supported selector values:
++
++- one tool id from the list above: expose only that independent edit tool, while keeping `write`.
++- `all`: expose all independent edit tools.
++- `legacy`: hide independent edit tools and keep OpenCode's legacy `edit` / `apply_patch` behavior.
++
++## Original Edit Strategy Baseline
++
++OpenCode's model-facing `edit` tool schema is unchanged:
++
++```json
++{
++  "filePath": "/absolute/path",
++  "oldString": "text to replace",
++  "newString": "replacement text",
++  "replaceAll": false
++}
++```
++
++The implementation can be swapped by setting `OPENCODE_EDIT_STRATEGY` before running
++the agent. This keeps model prompts and tool-call shape constant, so SWE-bench Pro runs
++measure the edit engine rather than a new tool API.
++
++## Strategies
++
++- `fuzzy`: current OpenCode behavior; tries exact match, trimmed-line match, block anchors,
++  whitespace normalization, indentation-flexible matching, escape normalization, trimmed
++  boundaries, context matching, and multi-occurrence matching.
++- `exact`: exact `oldString` matching only.
++- `line_trimmed`: exact, then line-trimmed matching.
++- `block_anchor`: exact, then block-anchor matching.
++- `whitespace`: exact, then whitespace-normalized matching.
++- `indentation`: exact, then indentation-flexible matching.
++- `escape`: exact, then escape-normalized matching.
++- `trimmed_boundary`: exact, then boundary-trimmed matching.
++- `context`: exact, then context-aware matching.
++- `multi_occurrence`: exact, then multi-occurrence matching.
++
++Each successful edit records these fields in tool metadata:
++
++- `editStrategy`: the selected strategy.
++- `replacements`: number of replacements applied to the matched span.
++
++## Example
++
++```bash
++OPENCODE_EDIT_STRATEGY=exact bun run --cwd packages/opencode src/index.ts --help
++```
++
++For SWE-bench Pro, run the same harness repeatedly with one strategy per run, for example:
++
++```bash
++for strategy in fuzzy exact line_trimmed block_anchor whitespace indentation escape trimmed_boundary context multi_occurrence; do
++  OPENCODE_EDIT_STRATEGY="$strategy" \
++    <swe-bench-pro-runner-command> \
++    --output "runs/swebench-pro-$strategy.jsonl"
++done
++```
++
++Recommended comparison metrics:
++
++- resolved rate
++- edit tool failure rate
++- `oldString` not found rate
++- multiple-match rate
++- malformed/no-op edit rate
++- average edit calls per instance
++- average changed lines per accepted edit
++- tool metadata distribution by `editStrategy`
+diff --git a/packages/opencode/src/tool/apply_unified_patch.ts b/packages/opencode/src/tool/apply_unified_patch.ts
+new file mode 100644
+index 0000000..0bdaa2b
+--- /dev/null
++++ b/packages/opencode/src/tool/apply_unified_patch.ts
+@@ -0,0 +1,123 @@
++import path from "path"
++import { applyPatch, parsePatch } from "diff"
++import { Effect, Schema } from "effect"
++import { InstanceState } from "@/effect/instance-state"
++import * as Tool from "./tool"
++import DESCRIPTION from "./apply_unified_patch.txt"
++import {
++  captureEditToolkitServices,
++  commitFileChanges,
++  editError,
++  readExistingTextFile,
++  resolveToolFile,
++  verifySha256,
++  type EditPlan,
++  type EditToolkitServices,
++  type PlannedFileChange,
++} from "./edit_toolkit"
++import { assertExternalDirectoryEffect } from "./external-directory"
++import type { Context } from "./tool"
++
++export const Parameters = Schema.Struct({
++  patch: Schema.String.annotate({ description: "A standard unified diff patch." }),
++  expected_files: Schema.optional(Schema.Record(Schema.String, Schema.String)).annotate({
++    description: "Optional map of file path to expected current sha256.",
++  }),
++  allow_fuzz: Schema.optional(Schema.Boolean).annotate({
++    description: "Allow fuzzy hunk matching. Defaults to false.",
++  }),
++})
++
++export const planApplyUnifiedPatch = (
++  services: EditToolkitServices,
++  ctx: Context,
++  params: Schema.Schema.Type<typeof Parameters>,
++) =>
++  Effect.gen(function* () {
++    if (params.patch.trim() === "") throw editError("PATCH_PARSE_ERROR", "patch must not be empty")
++    const instance = yield* InstanceState.context
++    const patches = parsePatchOrThrow(params.patch)
++    if (patches.length === 0) throw editError("PATCH_PARSE_ERROR", "no file patches found")
++
++    const changes = yield* Effect.forEach(patches, (patch) =>
++      Effect.gen(function* () {
++        const kind = patchKind(patch.oldFileName, patch.newFileName)
++        const patchFile = normalizePatchFileName(kind === "delete" ? patch.oldFileName : patch.newFileName)
++        if (!patchFile) throw editError("PATCH_PARSE_ERROR", "patch file path is missing")
++        const filePath = resolveToolFile(instance, patchFile)
++        yield* assertExternalDirectoryEffect(ctx, filePath)
++        const expected = expectedHash(params.expected_files, filePath, path.relative(instance.directory, filePath))
++
++        if (kind === "add") {
++          if (yield* services.fs.existsSafe(filePath)) throw editError("PATCH_APPLY_ERROR", `${filePath} already exists`)
++          const applied = applyPatchOrThrow("", patch, params.allow_fuzz ?? false)
++          return { filePath, oldContent: "", newContent: applied.content, bom: false, kind, fuzzy: applied.fuzzy }
++        }
++
++        const source = yield* readExistingTextFile(services.fs, filePath)
++        yield* verifySha256(services.fs, filePath, expected)
++        const applied = applyPatchOrThrow(source.text, patch, params.allow_fuzz ?? false)
++        return { filePath, oldContent: source.text, newContent: applied.content, bom: source.bom, kind, fuzzy: applied.fuzzy }
++      }),
++    )
++
++    // Only warn about fuzz when a hunk actually required it, not merely because
++    // the caller permitted it.
++    const fuzzyApplied = changes.some((change) => change.fuzzy)
++    return {
++      changes: changes.map(({ fuzzy: _fuzzy, ...change }) => change satisfies PlannedFileChange),
++      warnings: fuzzyApplied ? ["fuzzy_applied=true"] : [],
++    } satisfies EditPlan
++  })
++
++export const ApplyUnifiedPatchTool = Tool.define(
++  "apply_unified_patch",
++  Effect.gen(function* () {
++    const services = yield* captureEditToolkitServices
++    return {
++      description: DESCRIPTION,
++      parameters: Parameters,
++      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
++        Effect.gen(function* () {
++          const plan = yield* planApplyUnifiedPatch(services, ctx, params)
++          return yield* commitFileChanges(services, { tool: "apply_unified_patch", ctx, ...plan })
++        }).pipe(Effect.orDie),
++    }
++  }),
++)
++
++function parsePatchOrThrow(patch: string) {
++  try {
++    return parsePatch(patch)
++  } catch (error) {
++    throw editError("PATCH_PARSE_ERROR", error instanceof Error ? error.message : String(error))
++  }
++}
++
++function applyPatchOrThrow(content: string, patch: ReturnType<typeof parsePatch>[number], allowFuzz: boolean) {
++  // Try a strict apply first so we can tell whether fuzz was genuinely needed.
++  const strict = applyPatch(content, patch, { fuzzFactor: 0, autoConvertLineEndings: true })
++  if (strict !== false) return { content: strict, fuzzy: false }
++  if (allowFuzz) {
++    const fuzzy = applyPatch(content, patch, { fuzzFactor: 2, autoConvertLineEndings: true })
++    if (fuzzy !== false) return { content: fuzzy, fuzzy: true }
++  }
++  throw editError("PATCH_APPLY_ERROR", `failed to apply patch for ${patch.newFileName}`)
++}
++
++function patchKind(oldFileName: string | undefined, newFileName: string | undefined): PlannedFileChange["kind"] {
++  if (oldFileName === "/dev/null") return "add"
++  if (newFileName === "/dev/null") return "delete"
++  return "update"
++}
++
++function normalizePatchFileName(fileName: string | undefined) {
++  if (!fileName || fileName === "/dev/null") return undefined
++  const withoutPrefix = fileName.startsWith("a/") || fileName.startsWith("b/") ? fileName.slice(2) : fileName
++  return withoutPrefix.replace(/^"|"$/g, "")
++}
++
++function expectedHash(expectedFiles: Record<string, string> | undefined, filePath: string, relativePath: string) {
++  if (!expectedFiles) return undefined
++  return expectedFiles[filePath] ?? expectedFiles[relativePath] ?? expectedFiles[`a/${relativePath}`] ?? expectedFiles[`b/${relativePath}`]
++}
+diff --git a/packages/opencode/src/tool/apply_unified_patch.txt b/packages/opencode/src/tool/apply_unified_patch.txt
+new file mode 100644
+index 0000000..33fd5bd
+--- /dev/null
++++ b/packages/opencode/src/tool/apply_unified_patch.txt
+@@ -0,0 +1,8 @@
++Apply a standard unified diff patch, optionally across multiple files. Every file is verified before anything is written, so a failure leaves no partial changes. Fuzz is disabled unless `allow_fuzz` is set; when fuzz is actually used, the result reports `fuzzy_applied=true`. Use `/dev/null` as the old or new path to add or delete a file.
++
++Example: change one line and create a new file in a single patch.
++{
++  "patch": "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+gamma\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+created\n"
++}
++
++Pass `expected_files` (a map of path to expected current sha256) to reject the patch if any target file changed since you read it. Patches are sensitive to line numbers and context — generate them from the current file contents.
+diff --git a/packages/opencode/src/tool/edit_plans.ts b/packages/opencode/src/tool/edit_plans.ts
+new file mode 100644
+index 0000000..f6c8dba
+--- /dev/null
++++ b/packages/opencode/src/tool/edit_plans.ts
+@@ -0,0 +1,40 @@
++import { Effect, Schema } from "effect"
++import { editError, type EditPlan, type EditToolkitServices } from "./edit_toolkit"
++import type { Context } from "./tool"
++import { Parameters as ApplyUnifiedPatchParameters, planApplyUnifiedPatch } from "./apply_unified_patch"
++import { Parameters as InsertByAnchorParameters, planInsertByAnchor } from "./insert_by_anchor"
++import { Parameters as ReplaceByAnchorParameters, planReplaceByAnchor } from "./replace_by_anchor"
++import { Parameters as ReplaceExactParameters, planReplaceExact } from "./replace_exact"
++
++// A planner validates a raw edit spec against its tool's parameter schema and
++// produces an EditPlan without touching disk. edit_transaction dispatches through
++// this table to batch several primitive edits atomically.
++type Planner = {
++  schema: Schema.Schema<any>
++  plan: (services: EditToolkitServices, ctx: Context, params: any) => Effect.Effect<EditPlan, any, never>
++}
++
++const planners: Record<string, Planner> = {
++  replace_exact: { schema: ReplaceExactParameters, plan: planReplaceExact },
++  replace_by_anchor: { schema: ReplaceByAnchorParameters, plan: planReplaceByAnchor },
++  insert_by_anchor: { schema: InsertByAnchorParameters, plan: planInsertByAnchor },
++  apply_unified_patch: { schema: ApplyUnifiedPatchParameters, plan: planApplyUnifiedPatch },
++}
++
++export const EDIT_PLAN_TOOL_IDS = Object.keys(planners)
++
++export type EditSpec = { tool: string } & Record<string, unknown>
++
++export const planEdit = (services: EditToolkitServices, ctx: Context, spec: EditSpec) =>
++  Effect.gen(function* () {
++    const { tool, ...rest } = spec
++    const planner = planners[tool]
++    if (!planner) throw editError("UNKNOWN_EDIT_TOOL", `unknown edit tool: ${tool}`)
++    // The generic schema alias leaves the decoder's requirement channel as
++    // `unknown`; these schemas need no services, so pin it to `never`.
++    const decode = Schema.decodeUnknownEffect(planner.schema)(rest) as Effect.Effect<unknown, unknown, never>
++    const params = yield* decode.pipe(
++      Effect.mapError((error) => editError("INVALID_EDIT_SPEC", `invalid params for ${tool}: ${error}`)),
++    )
++    return yield* planner.plan(services, ctx, params)
++  })
+diff --git a/packages/opencode/src/tool/edit_toolkit.ts b/packages/opencode/src/tool/edit_toolkit.ts
+new file mode 100644
+index 0000000..f551ac2
+--- /dev/null
++++ b/packages/opencode/src/tool/edit_toolkit.ts
+@@ -0,0 +1,259 @@
++import path from "path"
++import { createHash } from "crypto"
++import { Effect } from "effect"
++import { createTwoFilesPatch, diffLines } from "diff"
++import { EventV2 } from "@opencode-ai/core/event"
++import { EventV2Bridge } from "@/event-v2-bridge"
++import { Format } from "@/format"
++import { InstanceState } from "@/effect/instance-state"
++import type { InstanceContext } from "@/project/instance-context"
++import { LSP } from "@/lsp/lsp"
++import { trimDiff } from "@/tool/edit"
++import type { Context, ExecuteResult } from "@/tool/tool"
++import * as Bom from "@/util/bom"
++import { FileSystem } from "@opencode-ai/core/filesystem"
++import { FSUtil } from "@opencode-ai/core/fs-util"
++import { Watcher } from "@opencode-ai/core/filesystem/watcher"
++import { assertExternalDirectoryEffect } from "./external-directory"
++
++export type FileChangeKind = "add" | "update" | "delete"
++
++export type PlannedFileChange = {
++  filePath: string
++  oldContent: string
++  newContent: string
++  bom: boolean
++  kind: FileChangeKind
++}
++
++export type EditPostcheck = {
++  parsed?: boolean
++  formatted?: boolean
++}
++
++// The pure result of an edit before it is committed: each tool builds an
++// EditPlan, then commits it via commitFileChanges.
++export type EditPlan = {
++  changes: PlannedFileChange[]
++  warnings?: string[]
++  postcheck?: EditPostcheck
++}
++
++type Diagnostics = Record<string, Parameters<typeof LSP.Diagnostic.report>[1]>
++
++export type EditToolkitServices = {
++  fs: FSUtil.Interface
++  lsp: LSP.Interface
++  format: Format.Interface
++  events: EventV2.Interface
++}
++
++export const captureEditToolkitServices = Effect.gen(function* () {
++  return {
++    fs: yield* FSUtil.Service,
++    lsp: yield* LSP.Service,
++    format: yield* Format.Service,
++    events: yield* EventV2Bridge.Service,
++  } satisfies EditToolkitServices
++})
++
++export type EditToolkitMetadata = {
++  ok: true
++  tool: string
++  files_changed: string[]
++  changed_lines: number
++  diff: string
++  warnings: string[]
++  requires_reread: true
++  postcheck: EditPostcheck
++  diagnostics: Diagnostics
++  files: Array<{
++    filePath: string
++    relativePath: string
++    type: FileChangeKind
++    patch: string
++    additions: number
++    deletions: number
++  }>
++}
++
++export function editError(code: string, message: string) {
++  return new Error(`${code}: ${message}`)
++}
++
++export function normalizeLineEndings(text: string): string {
++  return text.replaceAll("\r\n", "\n")
++}
++
++export function detectLineEnding(text: string): "\n" | "\r\n" {
++  return text.includes("\r\n") ? "\r\n" : "\n"
++}
++
++export function convertToLineEnding(text: string, ending: "\n" | "\r\n"): string {
++  if (ending === "\n") return normalizeLineEndings(text)
++  return normalizeLineEndings(text).replaceAll("\n", "\r\n")
++}
++
++export function resolveToolFile(instance: InstanceContext, file: string) {
++  return path.isAbsolute(file) ? file : path.join(instance.directory, file)
++}
++
++export function countOccurrences(content: string, search: string) {
++  if (search === "") return 0
++  return content.split(search).length - 1
++}
++
++export const readExistingTextFile = Effect.fn("EditToolkit.readExistingTextFile")(function* (
++  fs: FSUtil.Interface,
++  filePath: string,
++) {
++  const info = yield* fs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
++  if (!info) throw editError("FILE_NOT_FOUND", `${filePath} was not found`)
++  if (info.type === "Directory") throw editError("FILE_IS_DIRECTORY", `${filePath} is a directory`)
++  return yield* Bom.readFile(fs, filePath)
++})
++
++export const verifySha256 = Effect.fn("EditToolkit.verifySha256")(function* (
++  fs: FSUtil.Interface,
++  filePath: string,
++  expectedSha256?: string,
++) {
++  if (!expectedSha256) return
++  const actual = createHash("sha256").update(yield* fs.readFile(filePath)).digest("hex")
++  if (actual !== expectedSha256) {
++    throw editError("HASH_MISMATCH", `${filePath} sha256 was ${actual}, expected ${expectedSha256}`)
++  }
++})
++
++export const commitFileChanges = Effect.fn("EditToolkit.commitFileChanges")(function* (
++  services: EditToolkitServices,
++  input: {
++    tool: string
++    ctx: Context
++    changes: PlannedFileChange[]
++    warnings?: string[]
++    postcheck?: EditPostcheck
++  },
++) {
++  if (input.changes.length === 0) throw editError("NO_CHANGES", "no file changes were planned")
++  const instance = yield* InstanceState.context
++
++  const filesBeforeFormat = input.changes.map((change) => fileInfo(instance, change))
++  const totalDiff = filesBeforeFormat.map((file) => file.patch).join("\n")
++  const relativePaths = filesBeforeFormat.map((file) => file.relativePath)
++
++  yield* input.ctx.ask({
++    permission: "edit",
++    patterns: relativePaths,
++    always: ["*"],
++    metadata: {
++      filepath: relativePaths.join(", "),
++      diff: totalDiff,
++      files: filesBeforeFormat,
++    },
++  })
++
++  const finalized = yield* Effect.forEach(input.changes, (change) =>
++    Effect.gen(function* () {
++      if (change.kind === "delete") {
++        yield* services.fs.remove(change.filePath)
++        yield* services.events.publish(Watcher.Event.Updated, { file: change.filePath, event: "unlink" })
++        return { ...change, formatted: false }
++      }
++
++      yield* services.fs.writeWithDirs(change.filePath, Bom.join(change.newContent, change.bom))
++      const formatted = yield* services.format.file(change.filePath)
++      const newContent = formatted ? yield* Bom.syncFile(services.fs, change.filePath, change.bom) : change.newContent
++      yield* services.events.publish(FileSystem.Event.Edited, { file: change.filePath })
++      yield* services.events.publish(Watcher.Event.Updated, {
++        file: change.filePath,
++        event: change.kind === "add" ? "add" : "change",
++      })
++      return { ...change, newContent, formatted }
++    }),
++  )
++
++  for (const change of finalized) {
++    if (change.kind === "delete") continue
++    yield* services.lsp.touchFile(change.filePath, "document")
++  }
++  const diagnostics = yield* services.lsp.diagnostics()
++
++  const files = finalized.map((change) => fileInfo(instance, change))
++  const diff = files.map((file) => file.patch).join("\n")
++  const changedLines = files.reduce((sum, file) => sum + file.additions + file.deletions, 0)
++  const postcheck = {
++    ...input.postcheck,
++    formatted: finalized.some((change) => change.formatted) || input.postcheck?.formatted,
++  }
++  const metadata: EditToolkitMetadata = {
++    ok: true,
++    tool: input.tool,
++    files_changed: finalized.map((change) => change.filePath),
++    changed_lines: changedLines,
++    diff,
++    warnings: input.warnings ?? [],
++    requires_reread: true,
++    postcheck,
++    diagnostics,
++    files,
++  }
++  const output = [
++    `${input.tool} applied successfully.`,
++    ...files.map((file) => `${file.type.toUpperCase()} ${file.relativePath}`),
++  ].join("\n")
++
++  return {
++    title: files.map((file) => file.relativePath).join(", "),
++    metadata,
++    output: outputWithDiagnostics(output, finalized, diagnostics),
++  } satisfies ExecuteResult<EditToolkitMetadata>
++})
++
++function fileInfo(instance: InstanceContext, change: PlannedFileChange) {
++  const patch = trimDiff(
++    createTwoFilesPatch(
++      change.filePath,
++      change.filePath,
++      normalizeLineEndings(change.oldContent),
++      normalizeLineEndings(change.newContent),
++    ),
++  )
++  let additions = 0
++  let deletions = 0
++  for (const item of diffLines(change.oldContent, change.newContent)) {
++    if (item.added) additions += item.count || 0
++    if (item.removed) deletions += item.count || 0
++  }
++  return {
++    filePath: change.filePath,
++    relativePath: path.relative(instance.worktree, change.filePath).replaceAll("\\", "/"),
++    type: change.kind,
++    patch,
++    additions,
++    deletions,
++  }
++}
++
++function outputWithDiagnostics(
++  output: string,
++  changes: Array<PlannedFileChange & { formatted: boolean }>,
++  diagnostics: Diagnostics,
++) {
++  return changes.reduce((result, change) => {
++    if (change.kind === "delete") return result
++    const block = LSP.Diagnostic.report(change.filePath, diagnostics[FSUtil.normalizePath(change.filePath)] ?? [])
++    if (!block) return result
++    return `${result}\n\nLSP errors detected in this file, please fix:\n${block}`
++  }, output)
++}
++
++export const assertEditableFile = Effect.fn("EditToolkit.assertEditableFile")(function* (
++  ctx: Context,
++  fs: FSUtil.Interface,
++  filePath: string,
++) {
++  yield* assertExternalDirectoryEffect(ctx, filePath)
++  const source = yield* readExistingTextFile(fs, filePath)
++  return source
++})
+diff --git a/packages/opencode/src/tool/edit_transaction.ts b/packages/opencode/src/tool/edit_transaction.ts
+new file mode 100644
+index 0000000..b7d0b19
+--- /dev/null
++++ b/packages/opencode/src/tool/edit_transaction.ts
+@@ -0,0 +1,189 @@
++import { Effect, Schema } from "effect"
++import * as Tool from "./tool"
++import DESCRIPTION from "./edit_transaction.txt"
++import { FSUtil } from "@opencode-ai/core/fs-util"
++import * as Bom from "@/util/bom"
++import {
++  captureEditToolkitServices,
++  commitFileChanges,
++  editError,
++  type EditPlan,
++  type EditToolkitServices,
++  type PlannedFileChange,
++} from "./edit_toolkit"
++import { planEdit, type EditSpec } from "./edit_plans"
++
++export const Parameters = Schema.Struct({
++  edits: Schema.Array(Schema.Record(Schema.String, Schema.Unknown)).annotate({
++    description: "Edits to apply atomically. Each is an object with a `tool` field plus that tool's parameters.",
++  }),
++})
++
++export const EditTransactionTool = Tool.define(
++  "edit_transaction",
++  Effect.gen(function* () {
++    const services = yield* captureEditToolkitServices
++    return {
++      description: DESCRIPTION,
++      parameters: Parameters,
++      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
++        Effect.gen(function* () {
++          if (params.edits.length === 0) throw editError("NO_CHANGES", "edits must not be empty")
++
++          // Plan every edit before writing anything. Later edits see earlier
++          // planned changes through an in-memory overlay, so multiple edits can
++          // target the same file while the transaction still commits atomically.
++          const changesByPath = new Map<string, PlannedFileChange>()
++          const warnings: string[] = []
++          let postcheckParsed = false
++
++          for (const spec of params.edits) {
++            if (typeof spec.tool !== "string") throw editError("INVALID_EDIT_SPEC", "each edit needs a string `tool`")
++            const plan = yield* planEdit(overlayServices(services, changesByPath), ctx, spec as EditSpec)
++            for (const change of plan.changes) {
++              mergePlannedChange(changesByPath, change)
++            }
++            warnings.push(...(plan.warnings ?? []))
++            postcheckParsed ||= !!plan.postcheck?.parsed
++          }
++
++          const postcheck = postcheckParsed ? { parsed: true } : undefined
++          return yield* commitFileChanges(services, {
++            tool: "edit_transaction",
++            ctx,
++            changes: [...changesByPath.values()],
++            warnings,
++            postcheck,
++          })
++        }).pipe(Effect.orDie),
++    }
++  }),
++)
++
++function overlayServices(
++  services: EditToolkitServices,
++  changesByPath: ReadonlyMap<string, PlannedFileChange>,
++): EditToolkitServices {
++  return {
++    ...services,
++    fs: overlayFileSystem(services.fs, changesByPath),
++  }
++}
++
++function overlayFileSystem(
++  fs: FSUtil.Interface,
++  changesByPath: ReadonlyMap<string, PlannedFileChange>,
++): FSUtil.Interface {
++  const overlayText = (filePath: string) => {
++    const change = changesByPath.get(filePath)
++    if (!change || change.kind === "delete") return undefined
++    return Bom.join(change.newContent, change.bom)
++  }
++
++  const notFound = (method: string, filePath: string) =>
++    new FSUtil.FileSystemError({ method, cause: new Error(`${filePath} was deleted in this transaction`) })
++
++  return {
++    ...fs,
++    exists: (filePath: string) => {
++      const change = changesByPath.get(filePath)
++      if (change) return Effect.succeed(change.kind !== "delete")
++      return fs.exists(filePath)
++    },
++    existsSafe: (filePath: string) => {
++      const change = changesByPath.get(filePath)
++      if (change) return Effect.succeed(change.kind !== "delete")
++      return fs.existsSafe(filePath)
++    },
++    isFile: (filePath: string) => {
++      const change = changesByPath.get(filePath)
++      if (change) return Effect.succeed(change.kind !== "delete")
++      return fs.isFile(filePath)
++    },
++    isDir: (filePath: string) => {
++      const change = changesByPath.get(filePath)
++      if (change) return Effect.succeed(false)
++      return fs.isDir(filePath)
++    },
++    stat: (filePath: string) => {
++      const change = changesByPath.get(filePath)
++      if (!change) return fs.stat(filePath)
++      if (change.kind === "delete") return Effect.fail(notFound("stat", filePath))
++      return fs.stat(filePath).pipe(Effect.catch(() => Effect.succeed({ type: "File" } as any)))
++    },
++    readFile: (filePath: string) => {
++      const text = overlayText(filePath)
++      if (text !== undefined) return Effect.succeed(new TextEncoder().encode(text))
++      if (changesByPath.get(filePath)?.kind === "delete") return Effect.fail(notFound("readFile", filePath))
++      return fs.readFile(filePath)
++    },
++    readFileString: (filePath: string) => {
++      const text = overlayText(filePath)
++      if (text !== undefined) return Effect.succeed(text)
++      if (changesByPath.get(filePath)?.kind === "delete") return Effect.fail(notFound("readFileString", filePath))
++      return fs.readFileString(filePath)
++    },
++    readFileStringSafe: (filePath: string) => {
++      const text = overlayText(filePath)
++      if (text !== undefined) return Effect.succeed(text)
++      if (changesByPath.get(filePath)?.kind === "delete") return Effect.succeed(undefined)
++      return fs.readFileStringSafe(filePath)
++    },
++  } as FSUtil.Interface
++}
++
++function mergePlannedChange(changesByPath: Map<string, PlannedFileChange>, next: PlannedFileChange) {
++  const prior = changesByPath.get(next.filePath)
++  if (!prior) {
++    changesByPath.set(next.filePath, next)
++    return
++  }
++
++  const merged = squashSequentialChange(prior, next)
++  if (!merged) {
++    changesByPath.delete(next.filePath)
++    return
++  }
++  changesByPath.set(next.filePath, merged)
++}
++
++function squashSequentialChange(prior: PlannedFileChange, next: PlannedFileChange): PlannedFileChange | undefined {
++  if (prior.kind === "add") {
++    if (next.kind === "delete") return undefined
++    return keepIfChanged({
++      ...next,
++      oldContent: "",
++      kind: "add",
++    })
++  }
++
++  if (prior.kind === "delete") {
++    if (next.kind === "add") {
++      return keepIfChanged({
++        ...next,
++        oldContent: prior.oldContent,
++        kind: "update",
++      })
++    }
++    return next
++  }
++
++  if (next.kind === "delete") {
++    return {
++      ...next,
++      oldContent: prior.oldContent,
++      kind: "delete",
++    }
++  }
++
++  return keepIfChanged({
++    ...next,
++    oldContent: prior.oldContent,
++    kind: "update",
++  })
++}
++
++function keepIfChanged(change: PlannedFileChange): PlannedFileChange | undefined {
++  if (change.kind === "update" && change.oldContent === change.newContent) return undefined
++  return change
++}
+diff --git a/packages/opencode/src/tool/edit_transaction.txt b/packages/opencode/src/tool/edit_transaction.txt
+new file mode 100644
+index 0000000..ab9da27
+--- /dev/null
++++ b/packages/opencode/src/tool/edit_transaction.txt
+@@ -0,0 +1,11 @@
++Apply several edits atomically: all of them succeed and are written together, or none are. Pass an `edits` array; each entry is an object with a `tool` field (replace_exact, replace_by_anchor, insert_by_anchor, or apply_unified_patch) plus that tool's parameters. Every edit is planned and validated first; if any fails, nothing is written. Batching multiple confident edits in one call (instead of one tool call each) keeps large multi-file changes consistent and reduces round-trips.
++
++Edits are planned in order. Later edits see earlier edits in the same transaction, so multiple edits may target the same file. This wrapper only guarantees atomicity — it does not judge whether the change is correct.
++
++Example: change a function and add its test in one shot.
++{
++  "edits": [
++    { "tool": "replace_exact", "file": "src/auth.ts", "old": "return null", "new": "throw new AuthError()" },
++    { "tool": "insert_by_anchor", "file": "src/auth.test.ts", "anchor": "describe('auth', () => {", "position": "after", "content": "\n  it('throws', () => {})" }
++  ]
++}
+diff --git a/packages/opencode/src/tool/insert_by_anchor.ts b/packages/opencode/src/tool/insert_by_anchor.ts
+new file mode 100644
+index 0000000..7bb346b
+--- /dev/null
++++ b/packages/opencode/src/tool/insert_by_anchor.ts
+@@ -0,0 +1,99 @@
++import { Effect, Schema } from "effect"
++import { InstanceState } from "@/effect/instance-state"
++import * as Tool from "./tool"
++import DESCRIPTION from "./insert_by_anchor.txt"
++import {
++  assertEditableFile,
++  captureEditToolkitServices,
++  commitFileChanges,
++  convertToLineEnding,
++  countOccurrences,
++  detectLineEnding,
++  editError,
++  resolveToolFile,
++  verifySha256,
++  type EditPlan,
++  type EditToolkitServices,
++} from "./edit_toolkit"
++import type { Context } from "./tool"
++
++export const Parameters = Schema.Struct({
++  file: Schema.String.annotate({ description: "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace." }),
++  expected_sha256: Schema.optional(Schema.String).annotate({
++    description: "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++  }),
++  anchor: Schema.String.annotate({ description: "Literal anchor text." }),
++  position: Schema.Literals(["before", "after"]).annotate({ description: "Insert before or after the anchor." }),
++  content: Schema.String.annotate({ description: "Text to insert." }),
++  expected_matches: Schema.optional(Schema.Number).annotate({ description: "Expected anchor occurrence count. Defaults to 1." }),
++  max_insert_lines: Schema.optional(Schema.Number).annotate({ description: "Maximum inserted lines. Defaults to 200." }),
++  must_not_already_contain: Schema.optional(Schema.String).annotate({
++    description: "Optional duplicate guard. If the file already contains this text, the edit is rejected.",
++  }),
++})
++
++export const planInsertByAnchor = (
++  services: EditToolkitServices,
++  ctx: Context,
++  params: Schema.Schema.Type<typeof Parameters>,
++) =>
++  Effect.gen(function* () {
++    if (params.anchor === "") throw editError("ANCHOR_NOT_FOUND", "anchor must not be empty")
++    if (params.content === "") throw editError("NO_CHANGES", "content must not be empty")
++    const lineCount = params.content.split("\n").length
++    if (lineCount > (params.max_insert_lines ?? 200)) {
++      throw editError("MAX_CHANGE_LIMIT_EXCEEDED", `insert has ${lineCount} lines`)
++    }
++    const instance = yield* InstanceState.context
++    const filePath = resolveToolFile(instance, params.file)
++    const source = yield* assertEditableFile(ctx, services.fs, filePath)
++    yield* verifySha256(services.fs, filePath, params.expected_sha256)
++    if (params.must_not_already_contain && source.text.includes(params.must_not_already_contain)) {
++      throw editError("DUPLICATE_INSERT", `${filePath} already contains duplicate guard text`)
++    }
++
++    const ending = detectLineEnding(source.text)
++    const anchor = convertToLineEnding(params.anchor, ending)
++    const content = convertToLineEnding(params.content, ending)
++    const occurrences = countOccurrences(source.text, anchor)
++    const expected = params.expected_matches ?? 1
++    if (occurrences === 0) throw editError("ANCHOR_NOT_FOUND", "anchor was not found")
++    if (occurrences !== expected) {
++      throw editError("ANCHOR_NOT_UNIQUE", `anchor occurred ${occurrences} times, expected ${expected}`)
++    }
++
++    // Insert at every matched anchor. countOccurrences and replaceAll both
++    // use non-overlapping matching, so the count we validated is exactly the
++    // number of insertions performed.
++    const newContent =
++      params.position === "before"
++        ? source.text.replaceAll(anchor, content + anchor)
++        : source.text.replaceAll(anchor, anchor + content)
++    return {
++      changes: [
++        {
++          filePath,
++          oldContent: source.text,
++          newContent,
++          bom: source.bom,
++          kind: "update",
++        },
++      ],
++    } satisfies EditPlan
++  })
++
++export const InsertByAnchorTool = Tool.define(
++  "insert_by_anchor",
++  Effect.gen(function* () {
++    const services = yield* captureEditToolkitServices
++    return {
++      description: DESCRIPTION,
++      parameters: Parameters,
++      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
++        Effect.gen(function* () {
++          const plan = yield* planInsertByAnchor(services, ctx, params)
++          return yield* commitFileChanges(services, { tool: "insert_by_anchor", ctx, ...plan })
++        }).pipe(Effect.orDie),
++    }
++  }),
++)
+diff --git a/packages/opencode/src/tool/insert_by_anchor.txt b/packages/opencode/src/tool/insert_by_anchor.txt
+new file mode 100644
+index 0000000..b87fcaa
+--- /dev/null
++++ b/packages/opencode/src/tool/insert_by_anchor.txt
+@@ -0,0 +1,12 @@
++Insert text before or after a literal anchor. Mechanical only: no AST awareness. The anchor must occur exactly `expected_matches` times (default 1); the insertion is performed at every matched anchor. Ideal for adding a test case, a helper, or a config entry without rewriting the file.
++
++Example: add a test case after the describe block opener.
++{
++  "file": "src/auth.test.ts",
++  "anchor": "describe('login', () => {",
++  "position": "after",
++  "content": "\n  it('rejects missing profile', () => {})",
++  "must_not_already_contain": "rejects missing profile"
++}
++
++Use `must_not_already_contain` as a duplicate guard, and `max_insert_lines` (default 200) to cap the inserted size.
+diff --git a/packages/opencode/src/tool/lsp_symbol.ts b/packages/opencode/src/tool/lsp_symbol.ts
+new file mode 100644
+index 0000000..46655e4
+--- /dev/null
++++ b/packages/opencode/src/tool/lsp_symbol.ts
+@@ -0,0 +1,106 @@
++import { Effect, Schema } from "effect"
++import { pathToFileURL } from "url"
++import { InstanceState } from "@/effect/instance-state"
++import * as Tool from "./tool"
++import DESCRIPTION from "./lsp_symbol.txt"
++import {
++  assertEditableFile,
++  captureEditToolkitServices,
++  commitFileChanges,
++  convertToLineEnding,
++  detectLineEnding,
++  editError,
++  resolveToolFile,
++  verifySha256,
++} from "./edit_toolkit"
++
++export const Parameters = Schema.Struct({
++  file: Schema.String.annotate({ description: "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace." }),
++  name: Schema.String.annotate({ description: "Name of the symbol (function/method/class/...) to replace." }),
++  new_text: Schema.String.annotate({ description: "Full replacement text for the entire symbol (signature + body)." }),
++  container: Schema.optional(Schema.String).annotate({
++    description: "Containing type/class/namespace name, to disambiguate (e.g. a method).",
++  }),
++  expected_sha256: Schema.optional(Schema.String).annotate({
++    description: "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++  }),
++})
++
++// Minimal shapes for the raw LSP documentSymbol result (opencode returns it
++// uncast at runtime): hierarchical DocumentSymbol[] or flat SymbolInformation[].
++type Position = { line: number; character: number }
++type LspRange = { start: Position; end: Position }
++type RawDocumentSymbol = { name: string; range: LspRange; children?: RawDocumentSymbol[] }
++type RawSymbolInformation = { name: string; location: { range: LspRange }; containerName?: string }
++type RawSymbol = RawDocumentSymbol | RawSymbolInformation
++type FlatSymbol = { name: string; range: LspRange; container?: string }
++
++export const LspSymbolTool = Tool.define(
++  "lsp_symbol",
++  Effect.gen(function* () {
++    const services = yield* captureEditToolkitServices
++    return {
++      description: DESCRIPTION,
++      parameters: Parameters,
++      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
++        Effect.gen(function* () {
++          if (params.new_text === "") throw editError("NO_CHANGES", "new_text must not be empty")
++          const instance = yield* InstanceState.context
++          const filePath = resolveToolFile(instance, params.file)
++          const source = yield* assertEditableFile(ctx, services.fs, filePath)
++          yield* verifySha256(services.fs, filePath, params.expected_sha256)
++
++          const available = yield* services.lsp.hasClients(filePath)
++          if (!available) throw editError("LSP_UNAVAILABLE", `no LSP server available for ${filePath}`)
++          // Open/index the file so the server can answer documentSymbol.
++          yield* services.lsp.touchFile(filePath, "document")
++
++          const uri = pathToFileURL(filePath).href
++          const symbols = yield* services.lsp.documentSymbol(uri)
++          const flat = flatten(symbols as unknown as RawSymbol[])
++          const matches = flat.filter(
++            (s) => s.name === params.name && (!params.container || s.container === params.container),
++          )
++          if (matches.length === 0) throw editError("SYMBOL_NOT_FOUND", `symbol ${params.name} was not found by LSP in ${filePath}`)
++          if (matches.length > 1) throw editError("SYMBOL_NOT_UNIQUE", `symbol ${params.name} matched ${matches.length} times; pass container`)
++
++          const ending = detectLineEnding(source.text)
++          const start = offsetAt(source.text, matches[0].range.start)
++          const end = offsetAt(source.text, matches[0].range.end)
++          const newContent = source.text.slice(0, start) + convertToLineEnding(params.new_text, ending) + source.text.slice(end)
++          if (newContent === source.text) throw editError("NO_CHANGES", "new_text is identical to the existing symbol")
++
++          return yield* commitFileChanges(services, {
++            tool: "lsp_symbol",
++            ctx,
++            changes: [{ filePath, oldContent: source.text, newContent, bom: source.bom, kind: "update" }],
++            postcheck: { parsed: true },
++          })
++        }).pipe(Effect.orDie),
++    }
++  }),
++)
++
++// Flatten the documentSymbol result (hierarchical DocumentSymbol[] or flat
++// SymbolInformation[]) into name/range/container triples.
++function flatten(symbols: RawSymbol[], parent?: string): FlatSymbol[] {
++  const out: FlatSymbol[] = []
++  for (const sym of symbols) {
++    if ("location" in sym) {
++      out.push({ name: sym.name, range: sym.location.range, container: sym.containerName })
++    } else {
++      out.push({ name: sym.name, range: sym.range, container: parent })
++      if (sym.children?.length) out.push(...flatten(sym.children, sym.name))
++    }
++  }
++  return out
++}
++
++// LSP positions are 0-based {line, character} in UTF-16 code units (matching JS
++// string indexing); convert to a byte/char offset into the file text.
++function offsetAt(text: string, pos: { line: number; character: number }): number {
++  const lines = text.split("\n")
++  let offset = 0
++  for (let i = 0; i < pos.line && i < lines.length; i++) offset += lines[i].length + 1
++  return offset + pos.character
++}
+diff --git a/packages/opencode/src/tool/lsp_symbol.txt b/packages/opencode/src/tool/lsp_symbol.txt
+new file mode 100644
+index 0000000..3e50489
+--- /dev/null
++++ b/packages/opencode/src/tool/lsp_symbol.txt
+@@ -0,0 +1,12 @@
++Replace a whole symbol (function, method, class, etc.) located via the language server (LSP). Works for any language that has a running LSP server (Go/gopls, Python/pyright, TS-JS/typescript-language-server, …) — unlike text tools it finds the symbol structurally, so it does not depend on exact surrounding text.
++
++The symbol must be unique in the file (use `container` to disambiguate a method by its class). `new_text` REPLACES the entire symbol range (signature + body), so provide the complete new definition. The file is re-checked by the language server after the edit.
++
++Example: rewrite a Go function.
++{
++  "file": "server/events/sse.go",
++  "name": "shouldSend",
++  "new_text": "func (b *broker) shouldSend(...) bool {\n\t// new implementation\n}"
++}
++
++For a method, pass `container` with the type/class name. If the symbol is not found, the LSP server may still be indexing a large repo — read the file first (which warms the server) and retry, or fall back to a text edit tool.
+diff --git a/packages/opencode/src/tool/replace_by_anchor.ts b/packages/opencode/src/tool/replace_by_anchor.ts
+new file mode 100644
+index 0000000..847f01f
+--- /dev/null
++++ b/packages/opencode/src/tool/replace_by_anchor.ts
+@@ -0,0 +1,120 @@
++import { Effect, Schema } from "effect"
++import { InstanceState } from "@/effect/instance-state"
++import * as Tool from "./tool"
++import DESCRIPTION from "./replace_by_anchor.txt"
++import {
++  assertEditableFile,
++  captureEditToolkitServices,
++  commitFileChanges,
++  convertToLineEnding,
++  detectLineEnding,
++  editError,
++  resolveToolFile,
++  verifySha256,
++  type EditPlan,
++  type EditToolkitServices,
++} from "./edit_toolkit"
++import type { Context } from "./tool"
++
++export const Parameters = Schema.Struct({
++  file: Schema.String.annotate({ description: "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace." }),
++  expected_sha256: Schema.optional(Schema.String).annotate({
++    description: "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++  }),
++  start_anchor: Schema.String.annotate({ description: "Literal text marking the start of the target range." }),
++  end_anchor: Schema.String.annotate({ description: "Literal text marking the end of the target range." }),
++  include_start: Schema.optional(Schema.Boolean).annotate({ description: "Whether to replace the start anchor itself. Defaults to true." }),
++  include_end: Schema.optional(Schema.Boolean).annotate({ description: "Whether to replace the end anchor itself. Defaults to true." }),
++  expected_matches: Schema.optional(Schema.Number).annotate({ description: "Expected number of matching ranges. Defaults to 1." }),
++  max_target_lines: Schema.optional(Schema.Number).annotate({ description: "Maximum target range size in lines. Defaults to 200." }),
++  new: Schema.String.annotate({ description: "Replacement text for the selected range." }),
++})
++
++export const planReplaceByAnchor = (
++  services: EditToolkitServices,
++  ctx: Context,
++  params: Schema.Schema.Type<typeof Parameters>,
++) =>
++  Effect.gen(function* () {
++    if (params.start_anchor === "") throw editError("ANCHOR_NOT_FOUND", "start_anchor must not be empty")
++    if (params.end_anchor === "") throw editError("ANCHOR_NOT_FOUND", "end_anchor must not be empty")
++    const instance = yield* InstanceState.context
++    const filePath = resolveToolFile(instance, params.file)
++    const source = yield* assertEditableFile(ctx, services.fs, filePath)
++    yield* verifySha256(services.fs, filePath, params.expected_sha256)
++
++    const ending = detectLineEnding(source.text)
++    const startAnchor = convertToLineEnding(params.start_anchor, ending)
++    const endAnchor = convertToLineEnding(params.end_anchor, ending)
++    const matches = findAnchorRanges(source.text, startAnchor, endAnchor, {
++      includeStart: params.include_start ?? true,
++      includeEnd: params.include_end ?? true,
++      maxTargetLines: params.max_target_lines ?? 200,
++    })
++    // This tool replaces exactly one range with a single replacement, so it
++    // only ever supports a unique match. Reject expected_matches > 1 up front
++    // instead of silently treating the parameter as inert.
++    const expected = params.expected_matches ?? 1
++    if (expected !== 1) {
++      throw editError("SINGLE_RANGE_ONLY", "replace_by_anchor only edits a single range; expected_matches must be 1")
++    }
++    if (matches.length === 0) throw editError("ANCHOR_NOT_FOUND", "anchors did not select a range")
++    if (matches.length !== 1) {
++      throw editError("ANCHOR_NOT_UNIQUE", `anchors selected ${matches.length} ranges, expected 1`)
++    }
++
++    const match = matches[0]
++    return {
++      changes: [
++        {
++          filePath,
++          oldContent: source.text,
++          newContent:
++            source.text.slice(0, match.start) + convertToLineEnding(params.new, ending) + source.text.slice(match.end),
++          bom: source.bom,
++          kind: "update",
++        },
++      ],
++    } satisfies EditPlan
++  })
++
++export const ReplaceByAnchorTool = Tool.define(
++  "replace_by_anchor",
++  Effect.gen(function* () {
++    const services = yield* captureEditToolkitServices
++    return {
++      description: DESCRIPTION,
++      parameters: Parameters,
++      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
++        Effect.gen(function* () {
++          const plan = yield* planReplaceByAnchor(services, ctx, params)
++          return yield* commitFileChanges(services, { tool: "replace_by_anchor", ctx, ...plan })
++        }).pipe(Effect.orDie),
++    }
++  }),
++)
++
++function findAnchorRanges(
++  content: string,
++  startAnchor: string,
++  endAnchor: string,
++  options: { includeStart: boolean; includeEnd: boolean; maxTargetLines: number },
++) {
++  const ranges: Array<{ start: number; end: number }> = []
++  let cursor = 0
++  while (cursor <= content.length) {
++    const startIndex = content.indexOf(startAnchor, cursor)
++    if (startIndex === -1) break
++    const endIndex = content.indexOf(endAnchor, startIndex + startAnchor.length)
++    if (endIndex === -1) break
++    const start = options.includeStart ? startIndex : startIndex + startAnchor.length
++    const end = options.includeEnd ? endIndex + endAnchor.length : endIndex
++    const targetLines = content.slice(start, end).split("\n").length
++    if (targetLines > options.maxTargetLines) {
++      throw editError("MAX_CHANGE_LIMIT_EXCEEDED", `anchor range has ${targetLines} lines`)
++    }
++    ranges.push({ start, end })
++    cursor = startIndex + startAnchor.length
++  }
++  return ranges
++}
+diff --git a/packages/opencode/src/tool/replace_by_anchor.txt b/packages/opencode/src/tool/replace_by_anchor.txt
+new file mode 100644
+index 0000000..04e6382
+--- /dev/null
++++ b/packages/opencode/src/tool/replace_by_anchor.txt
+@@ -0,0 +1,13 @@
++Replace a text range selected by literal `start_anchor` and `end_anchor` strings. The anchors must select exactly one range (no regex, no semantic guessing); the tool fails if zero or more than one range matches. More robust than replace_exact when the inner text drifts but the surrounding markers are stable. The range may not exceed `max_target_lines` (default 200).
++
++Example: replace a function body, keeping the braces.
++{
++  "file": "src/auth.ts",
++  "start_anchor": "function login() {",
++  "end_anchor": "}",
++  "include_start": true,
++  "include_end": true,
++  "new": "function login() {\n  return createSession()\n}"
++}
++
++This tool only ever edits a single range, so `expected_matches` must be 1.
+diff --git a/packages/opencode/src/tool/replace_exact.ts b/packages/opencode/src/tool/replace_exact.ts
+new file mode 100644
+index 0000000..825aa1f
+--- /dev/null
++++ b/packages/opencode/src/tool/replace_exact.ts
+@@ -0,0 +1,93 @@
++import { Effect, Schema } from "effect"
++import { InstanceState } from "@/effect/instance-state"
++import * as Tool from "./tool"
++import DESCRIPTION from "./replace_exact.txt"
++import {
++  assertEditableFile,
++  captureEditToolkitServices,
++  commitFileChanges,
++  convertToLineEnding,
++  countOccurrences,
++  detectLineEnding,
++  editError,
++  resolveToolFile,
++  verifySha256,
++  type EditPlan,
++  type EditToolkitServices,
++} from "./edit_toolkit"
++import type { Context } from "./tool"
++
++export const Parameters = Schema.Struct({
++  file: Schema.String.annotate({ description: "The file to edit. Absolute paths are accepted; relative paths resolve in the workspace." }),
++  expected_sha256: Schema.optional(Schema.String).annotate({
++    description: "Optional sha256 of the current file bytes. If provided, the edit is rejected when it does not match.",
++  }),
++  old: Schema.String.annotate({ description: "Exact text to replace." }),
++  new: Schema.String.annotate({ description: "Replacement text." }),
++  expected_occurrences: Schema.optional(Schema.Number).annotate({
++    description: "How many times old must occur. Defaults to 1.",
++  }),
++  replace_all: Schema.optional(Schema.Boolean).annotate({
++    description: "Replace all expected occurrences. Defaults to false; when false expected_occurrences must be 1.",
++  }),
++})
++
++export const planReplaceExact = (
++  services: EditToolkitServices,
++  ctx: Context,
++  params: Schema.Schema.Type<typeof Parameters>,
++) =>
++  Effect.gen(function* () {
++    if (params.old === params.new) throw editError("NO_CHANGES", "old and new are identical")
++    if (params.old === "") throw editError("OLD_TEXT_EMPTY", "old must not be empty")
++    const instance = yield* InstanceState.context
++    const filePath = resolveToolFile(instance, params.file)
++    const source = yield* assertEditableFile(ctx, services.fs, filePath)
++    yield* verifySha256(services.fs, filePath, params.expected_sha256)
++
++    const ending = detectLineEnding(source.text)
++    const oldText = convertToLineEnding(params.old, ending)
++    const newText = convertToLineEnding(params.new, ending)
++    const expected = params.expected_occurrences ?? 1
++    const occurrences = countOccurrences(source.text, oldText)
++    if (occurrences === 0) throw editError("OLD_TEXT_NOT_FOUND", `old text was not found in ${filePath}`)
++    if (occurrences !== expected) {
++      throw editError(
++        occurrences > 1 ? "AMBIGUOUS_MATCH" : "OCCURRENCE_MISMATCH",
++        `old text occurred ${occurrences} times in ${filePath}, expected ${expected}`,
++      )
++    }
++    if (!params.replace_all && expected !== 1) {
++      throw editError("AMBIGUOUS_MATCH", "replace_all must be true when expected_occurrences is greater than 1")
++    }
++
++    return {
++      changes: [
++        {
++          filePath,
++          oldContent: source.text,
++          newContent: params.replace_all
++            ? source.text.replaceAll(oldText, newText)
++            : source.text.replace(oldText, newText),
++          bom: source.bom,
++          kind: "update",
++        },
++      ],
++    } satisfies EditPlan
++  })
++
++export const ReplaceExactTool = Tool.define(
++  "replace_exact",
++  Effect.gen(function* () {
++    const services = yield* captureEditToolkitServices
++    return {
++      description: DESCRIPTION,
++      parameters: Parameters,
++      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
++        Effect.gen(function* () {
++          const plan = yield* planReplaceExact(services, ctx, params)
++          return yield* commitFileChanges(services, { tool: "replace_exact", ctx, ...plan })
++        }).pipe(Effect.orDie),
++    }
++  }),
++)
+diff --git a/packages/opencode/src/tool/replace_exact.txt b/packages/opencode/src/tool/replace_exact.txt
+new file mode 100644
+index 0000000..915b65b
+--- /dev/null
++++ b/packages/opencode/src/tool/replace_exact.txt
+@@ -0,0 +1,11 @@
++Replace an exact text block in a file. The `old` text must occur exactly the requested number of times (default 1); the tool refuses ambiguous matches instead of guessing. Best for small, surgical edits (one branch, a couple of imports, a test assertion). Read the file first so `old` matches byte-for-byte.
++
++Example: change a return into a throw.
++{
++  "file": "src/auth.ts",
++  "old": "if (!user) return null",
++  "new": "if (!user) throw new AuthError('User not found')",
++  "expected_occurrences": 1
++}
++
++To replace several identical occurrences, set `expected_occurrences` to the exact count and `replace_all` to true. Pass `expected_sha256` (sha256 of the current file bytes) to reject the edit if the file changed since you read it.
+diff --git a/packages/opencode/test/tool/edit_toolkit.test.ts b/packages/opencode/test/tool/edit_toolkit.test.ts
+new file mode 100644
+index 0000000..ba7d0b6
+--- /dev/null
++++ b/packages/opencode/test/tool/edit_toolkit.test.ts
+@@ -0,0 +1,411 @@
++import { afterEach, describe, expect } from "bun:test"
++import path from "path"
++import { createHash } from "crypto"
++import { Cause, Effect, Exit, Layer } from "effect"
++import { Agent } from "@/agent/agent"
++import { EventV2Bridge } from "@/event-v2-bridge"
++import { Format } from "@/format"
++import { LSP } from "@/lsp/lsp"
++import { MessageID, SessionID } from "@/session/schema"
++import { ApplyUnifiedPatchTool } from "@/tool/apply_unified_patch"
++import { EditTransactionTool } from "@/tool/edit_transaction"
++import { InsertByAnchorTool } from "@/tool/insert_by_anchor"
++import { ReplaceByAnchorTool } from "@/tool/replace_by_anchor"
++import { ReplaceExactTool } from "@/tool/replace_exact"
++import { Truncate } from "@/tool/truncate"
++import * as Tool from "@/tool/tool"
++import { FSUtil } from "@opencode-ai/core/fs-util"
++import { disposeAllInstances, TestInstance } from "../fixture/fixture"
++import { testEffect } from "../lib/effect"
++
++const ctx = {
++  sessionID: SessionID.make("ses_test-edit-toolkit-session"),
++  messageID: MessageID.make("msg_test"),
++  callID: "",
++  agent: "build",
++  abort: AbortSignal.any([]),
++  messages: [],
++  metadata: () => Effect.void,
++  ask: () => Effect.void,
++}
++
++afterEach(async () => {
++  await disposeAllInstances()
++})
++
++const layer = Layer.mergeAll(
++  LSP.defaultLayer,
++  FSUtil.defaultLayer,
++  Format.defaultLayer,
++  EventV2Bridge.defaultLayer,
++  Truncate.defaultLayer,
++  Agent.defaultLayer,
++)
++
++const it = testEffect(layer)
++
++const put = Effect.fn("EditToolkitTest.put")(function* (file: string, content: string) {
++  const fs = yield* FSUtil.Service
++  yield* fs.writeWithDirs(file, content)
++})
++
++const load = Effect.fn("EditToolkitTest.load")(function* (file: string) {
++  const fs = yield* FSUtil.Service
++  return yield* fs.readFileString(file)
++})
++
++const sha256 = (content: string) => createHash("sha256").update(content).digest("hex")
++
++type ToolEffect =
++  | typeof ApplyUnifiedPatchTool
++  | typeof EditTransactionTool
++  | typeof InsertByAnchorTool
++  | typeof ReplaceByAnchorTool
++  | typeof ReplaceExactTool
++
++const init = Effect.fn("EditToolkitTest.init")(function* (info: ToolEffect) {
++  const resolved = yield* info
++  return yield* resolved.init()
++})
++
++const run = Effect.fn("EditToolkitTest.run")(function* (info: ToolEffect, args: Record<string, unknown>) {
++  const tool = yield* init(info)
++  const execute = tool.execute as unknown as (
++    input: Record<string, unknown>,
++    next: Tool.Context,
++  ) => Effect.Effect<Tool.ExecuteResult>
++  return yield* execute(args, ctx)
++})
++
++const fail = Effect.fn("EditToolkitTest.fail")(function* (info: ToolEffect, args: Record<string, unknown>) {
++  const exit = yield* run(info, args).pipe(Effect.exit)
++  if (Exit.isFailure(exit)) {
++    const err = Cause.squash(exit.cause)
++    return err instanceof Error ? err : new Error(String(err))
++  }
++  throw new Error("expected edit toolkit tool to fail")
++})
++
++describe("edit toolkit tools", () => {
++  it.instance("replace_exact replaces one unique exact block and reports benchmark metadata", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "src/auth.ts")
++      yield* put(file, "const user = await findUser(email)\nif (!user) return null\n")
++
++      const result = yield* run(ReplaceExactTool, {
++        file,
++        expected_sha256: sha256("const user = await findUser(email)\nif (!user) return null\n"),
++        old: "if (!user) return null",
++        new: "if (!user) throw new AuthError('User not found')",
++      })
++
++      expect(yield* load(file)).toContain("throw new AuthError")
++      expect(result.metadata.ok).toBe(true)
++      expect(result.metadata.tool).toBe("replace_exact")
++      expect(result.metadata.files_changed).toEqual([file])
++      expect(result.metadata.changed_lines).toBeGreaterThan(0)
++      expect(result.metadata.requires_reread).toBe(true)
++      expect(result.metadata.diff).toContain("-if (!user) return null")
++    }),
++  )
++
++  it.instance("replace_exact rejects ambiguous matches without changing the file", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "dupe.txt")
++      yield* put(file, "foo\nfoo\n")
++
++      const error = yield* fail(ReplaceExactTool, { file, old: "foo", new: "bar" })
++
++      expect(error.message).toContain("AMBIGUOUS_MATCH")
++      expect(yield* load(file)).toBe("foo\nfoo\n")
++    }),
++  )
++
++  it.instance("replace_exact rejects hash mismatches before editing", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "hash.txt")
++      yield* put(file, "current\n")
++
++      const error = yield* fail(ReplaceExactTool, {
++        file,
++        expected_sha256: sha256("stale\n"),
++        old: "current",
++        new: "next",
++      })
++
++      expect(error.message).toContain("HASH_MISMATCH")
++      expect(yield* load(file)).toBe("current\n")
++    }),
++  )
++
++  it.instance("replace_by_anchor replaces the uniquely anchored range", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "anchor.ts")
++      yield* put(file, "before\nfunction login() {\n  return null\n}\nafter\n")
++
++      yield* run(ReplaceByAnchorTool, {
++        file,
++        start_anchor: "function login() {",
++        end_anchor: "}",
++        include_start: true,
++        include_end: true,
++        new: "function login() {\n  return createSession()\n}",
++      })
++
++      expect(yield* load(file)).toBe("before\nfunction login() {\n  return createSession()\n}\nafter\n")
++    }),
++  )
++
++  it.instance("insert_by_anchor inserts text after the unique anchor and supports duplicate guards", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "auth.test.ts")
++      yield* put(file, "describe('login', () => {\n})\n")
++
++      yield* run(InsertByAnchorTool, {
++        file,
++        anchor: "describe('login', () => {",
++        position: "after",
++        content: "\n  it('rejects missing profile', () => {})",
++        must_not_already_contain: "rejects missing profile",
++      })
++
++      expect(yield* load(file)).toBe("describe('login', () => {\n  it('rejects missing profile', () => {})\n})\n")
++    }),
++  )
++
++  it.instance("insert_by_anchor inserts at every occurrence when expected_matches matches the count", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "multi.ts")
++      yield* put(file, "// mark\ncode\n// mark\n")
++
++      yield* run(InsertByAnchorTool, {
++        file,
++        anchor: "// mark",
++        position: "after",
++        content: " inserted",
++        expected_matches: 2,
++      })
++
++      expect(yield* load(file)).toBe("// mark inserted\ncode\n// mark inserted\n")
++    }),
++  )
++
++  it.instance("insert_by_anchor rejects when occurrence count differs from expected_matches", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "multi.ts")
++      yield* put(file, "// mark\ncode\n// mark\n")
++
++      const error = yield* fail(InsertByAnchorTool, {
++        file,
++        anchor: "// mark",
++        position: "after",
++        content: " inserted",
++        expected_matches: 1,
++      })
++
++      expect(error.message).toContain("ANCHOR_NOT_UNIQUE")
++      expect(yield* load(file)).toBe("// mark\ncode\n// mark\n")
++    }),
++  )
++
++  it.instance("replace_by_anchor refuses expected_matches greater than one with a clear error", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "ranges.ts")
++      yield* put(file, "<a>one</a>\n<a>two</a>\n")
++
++      const error = yield* fail(ReplaceByAnchorTool, {
++        file,
++        start_anchor: "<a>",
++        end_anchor: "</a>",
++        expected_matches: 2,
++        new: "<a>x</a>",
++      })
++
++      expect(error.message).toContain("SINGLE_RANGE_ONLY")
++      expect(yield* load(file)).toBe("<a>one</a>\n<a>two</a>\n")
++    }),
++  )
++
++  it.instance("apply_unified_patch applies a standard multi-file unified diff atomically", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "file.txt")
++      yield* put(file, "alpha\nbeta\n")
++
++      const patch = [
++        "--- a/file.txt",
++        "+++ b/file.txt",
++        "@@ -1,2 +1,2 @@",
++        " alpha",
++        "-beta",
++        "+gamma",
++        "--- /dev/null",
++        "+++ b/new.txt",
++        "@@ -0,0 +1 @@",
++        "+created",
++        "",
++      ].join("\n")
++
++      const result = yield* run(ApplyUnifiedPatchTool, {
++        patch,
++        expected_files: {
++          "file.txt": sha256("alpha\nbeta\n"),
++        },
++      })
++
++      expect(yield* load(file)).toBe("alpha\ngamma\n")
++      expect(yield* load(path.join(test.directory, "new.txt"))).toBe("created\n")
++      expect(result.metadata.files_changed.toSorted()).toEqual([
++        path.join(test.directory, "file.txt"),
++        path.join(test.directory, "new.txt"),
++      ].toSorted())
++    }),
++  )
++
++  it.instance("apply_unified_patch does not report fuzz when a patch applies cleanly", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "clean.txt")
++      yield* put(file, "alpha\nbeta\n")
++
++      const result = yield* run(ApplyUnifiedPatchTool, {
++        patch: ["--- a/clean.txt", "+++ b/clean.txt", "@@ -1,2 +1,2 @@", " alpha", "-beta", "+gamma", ""].join("\n"),
++        allow_fuzz: true,
++      })
++
++      expect(yield* load(file)).toBe("alpha\ngamma\n")
++      expect(result.metadata.warnings).not.toContain("fuzzy_applied=true")
++    }),
++  )
++
++  it.instance("apply_unified_patch reports fuzz only when fuzzy matching was actually used", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "fuzzy.txt")
++      yield* put(file, "h1\nh2\nh3\nold_value\nf1\nf2\nf3\n")
++
++      const result = yield* run(ApplyUnifiedPatchTool, {
++        patch: [
++          "--- a/fuzzy.txt",
++          "+++ b/fuzzy.txt",
++          "@@ -1,7 +1,7 @@",
++          " h1",
++          " DRIFTED",
++          " h3",
++          "-old_value",
++          "+new_value",
++          " f1",
++          " f2",
++          " f3",
++          "",
++        ].join("\n"),
++        allow_fuzz: true,
++      })
++
++      expect(yield* load(file)).toContain("new_value")
++      expect(result.metadata.warnings).toContain("fuzzy_applied=true")
++    }),
++  )
++
++  it.instance("apply_unified_patch rolls back when any hunk fails", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const file = path.join(test.directory, "file.txt")
++      yield* put(file, "alpha\nbeta\n")
++
++      const error = yield* fail(ApplyUnifiedPatchTool, {
++        patch: ["--- a/file.txt", "+++ b/file.txt", "@@ -1,2 +1,2 @@", " alpha", "-missing", "+gamma", ""].join(
++          "\n",
++        ),
++      })
++
++      expect(error.message).toContain("PATCH_APPLY_ERROR")
++      expect(yield* load(file)).toBe("alpha\nbeta\n")
++    }),
++  )
++
++  it.instance("edit_transaction applies multiple edits across distinct files atomically", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const a = path.join(test.directory, "a.ts")
++      const b = path.join(test.directory, "b.ts")
++      yield* put(a, "export const a = 1\n")
++      yield* put(b, "export const b = 1\n")
++
++      yield* run(EditTransactionTool, {
++        edits: [
++          { tool: "replace_exact", file: a, old: "const a = 1", new: "const a = 2" },
++          { tool: "replace_exact", file: b, old: "const b = 1", new: "const b = 2" },
++        ],
++      })
++
++      expect(yield* load(a)).toBe("export const a = 2\n")
++      expect(yield* load(b)).toBe("export const b = 2\n")
++    }),
++  )
++
++  it.instance("edit_transaction rolls back every edit when one fails", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const a = path.join(test.directory, "a.ts")
++      const b = path.join(test.directory, "b.ts")
++      yield* put(a, "export const a = 1\n")
++      yield* put(b, "export const b = 1\n")
++
++      const error = yield* fail(EditTransactionTool, {
++        edits: [
++          { tool: "replace_exact", file: a, old: "const a = 1", new: "const a = 2" },
++          { tool: "replace_exact", file: b, old: "MISSING", new: "x" },
++        ],
++      })
++
++      expect(error.message).toContain("OLD_TEXT_NOT_FOUND")
++      expect(yield* load(a)).toBe("export const a = 1\n")
++      expect(yield* load(b)).toBe("export const b = 1\n")
++    }),
++  )
++
++  it.instance("edit_transaction composes multiple edits to the same file sequentially", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const a = path.join(test.directory, "a.ts")
++      yield* put(a, "export const a = 1\nexport const c = 1\n")
++
++      yield* run(EditTransactionTool, {
++        edits: [
++          { tool: "replace_exact", file: a, old: "const a = 1", new: "const a = 2" },
++          { tool: "replace_exact", file: a, old: "const c = 1", new: "const c = 2" },
++        ],
++      })
++
++      expect(yield* load(a)).toBe("export const a = 2\nexport const c = 2\n")
++    }),
++  )
++
++  it.instance("edit_transaction keeps same-file edits atomic when a later edit fails", () =>
++    Effect.gen(function* () {
++      const test = yield* TestInstance
++      const a = path.join(test.directory, "a.ts")
++      yield* put(a, "export const a = 1\nexport const c = 1\n")
++
++      const error = yield* fail(EditTransactionTool, {
++        edits: [
++          { tool: "replace_exact", file: a, old: "const a = 1", new: "const a = 2" },
++          { tool: "replace_exact", file: a, old: "const missing = 1", new: "const missing = 2" },
++        ],
++      })
++
++      expect(error.message).toContain("OLD_TEXT_NOT_FOUND")
++      expect(yield* load(a)).toBe("export const a = 1\nexport const c = 1\n")
++    }),
++  )
++
++})
+diff --git a/packages/opencode/test/tool/lsp_symbol.test.ts b/packages/opencode/test/tool/lsp_symbol.test.ts
+new file mode 100644
+index 0000000..d390cc9
+--- /dev/null
++++ b/packages/opencode/test/tool/lsp_symbol.test.ts
+@@ -0,0 +1,257 @@
++import { afterEach, describe, expect } from "bun:test"
++import path from "path"
++import { createHash } from "crypto"
++import { Cause, Effect, Exit, Layer } from "effect"
++import { Agent } from "@/agent/agent"
++import { EventV2Bridge } from "@/event-v2-bridge"
++import { Format } from "@/format"
++import { LSP } from "@/lsp/lsp"
++import { MessageID, SessionID } from "@/session/schema"
++import { LspSymbolTool } from "@/tool/lsp_symbol"
++import { Truncate } from "@/tool/truncate"
++import * as Tool from "@/tool/tool"
++import { FSUtil } from "@opencode-ai/core/fs-util"
++import { disposeAllInstances, TestInstance } from "../fixture/fixture"
++import { testEffect } from "../lib/effect"
++
++const ctx = {
++  sessionID: SessionID.make("ses_test-lsp-symbol-session"),
++  messageID: MessageID.make("msg_test"),
++  callID: "",
++  agent: "build",
++  abort: AbortSignal.any([]),
++  messages: [],
++  metadata: () => Effect.void,
++  ask: () => Effect.void,
++}
++
++afterEach(async () => {
++  await disposeAllInstances()
++})
++
++// Mutable knobs the mock LSP layer reads, so each test can stage its own
++// documentSymbol() result and client availability without rebuilding layers.
++let nextSymbols: unknown[] = []
++let clientsAvailable = true
++const touched: string[] = []
++
++const mockLSP = Layer.succeed(
++  LSP.Service,
++  LSP.Service.of({
++    init: () => Effect.void,
++    status: () => Effect.succeed([]),
++    hasClients: () => Effect.succeed(clientsAvailable),
++    touchFile: (file) =>
++      Effect.sync(() => {
++        touched.push(file)
++      }),
++    diagnostics: () => Effect.succeed({}),
++    hover: () => Effect.succeed([]),
++    definition: () => Effect.succeed([]),
++    references: () => Effect.succeed([]),
++    implementation: () => Effect.succeed([]),
++    documentSymbol: () => Effect.succeed(nextSymbols as never),
++    workspaceSymbol: () => Effect.succeed([]),
++    prepareCallHierarchy: () => Effect.succeed([]),
++    incomingCalls: () => Effect.succeed([]),
++    outgoingCalls: () => Effect.succeed([]),
++  }),
++)
++
++const layer = Layer.mergeAll(
++  mockLSP,
++  FSUtil.defaultLayer,
++  Format.defaultLayer,
++  EventV2Bridge.defaultLayer,
++  Truncate.defaultLayer,
++  Agent.defaultLayer,
++)
++
++const it = testEffect(layer)
++
++const put = Effect.fn("LspSymbolTest.put")(function* (file: string, content: string) {
++  const fs = yield* FSUtil.Service
++  yield* fs.writeWithDirs(file, content)
++})
++
++const load = Effect.fn("LspSymbolTest.load")(function* (file: string) {
++  const fs = yield* FSUtil.Service
++  return yield* fs.readFileString(file)
++})
++
++const sha256 = (content: string) => createHash("sha256").update(content).digest("hex")
++
++const run = Effect.fn("LspSymbolTest.run")(function* (args: Record<string, unknown>) {
++  const resolved = yield* LspSymbolTool
++  const tool = yield* resolved.init()
++  const execute = tool.execute as unknown as (
++    input: Record<string, unknown>,
++    next: Tool.Context,
++  ) => Effect.Effect<Tool.ExecuteResult>
++  return yield* execute(args, ctx)
++})
++
++const fail = Effect.fn("LspSymbolTest.fail")(function* (args: Record<string, unknown>) {
++  const exit = yield* run(args).pipe(Effect.exit)
++  if (Exit.isFailure(exit)) {
++    const err = Cause.squash(exit.cause)
++    return err instanceof Error ? err : new Error(String(err))
++  }
++  throw new Error("expected lsp_symbol to fail")
++})
++
++// A Go-ish source where Foo spans lines 2..4 (0-based) and Bar spans 6..8.
++// gopls reports a function's range as the start of `func` through just past the
++// closing `}`, which is what these ranges encode.
++const GO_SRC = "package main\n\nfunc Foo() int {\n\treturn 1\n}\n\nfunc Bar() int {\n\treturn 2\n}\n"
++const fooRange = { start: { line: 2, character: 0 }, end: { line: 4, character: 1 } }
++const barRange = { start: { line: 6, character: 0 }, end: { line: 8, character: 1 } }
++
++describe("tool.lsp_symbol", () => {
++  it.instance("replaces a hierarchical DocumentSymbol's full range", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "main.go")
++      yield* put(file, GO_SRC)
++      nextSymbols = [
++        { name: "Foo", range: fooRange },
++        { name: "Bar", range: barRange },
++      ]
++      clientsAvailable = true
++
++      const result = yield* run({ file, name: "Foo", new_text: "func Foo() int {\n\treturn 100\n}" })
++
++      // Only Foo's range is rewritten; Bar and surrounding text are untouched.
++      expect(yield* load(file)).toBe(
++        "package main\n\nfunc Foo() int {\n\treturn 100\n}\n\nfunc Bar() int {\n\treturn 2\n}\n",
++      )
++      expect(result.metadata.ok).toBe(true)
++      expect(result.metadata.tool).toBe("lsp_symbol")
++      expect(result.metadata.files_changed).toEqual([file])
++      expect(touched).toContain(file)
++    }),
++  )
++
++  it.instance("replaces a flat SymbolInformation entry using its location range", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "flat.go")
++      yield* put(file, GO_SRC)
++      nextSymbols = [
++        { name: "Foo", location: { range: fooRange }, containerName: "main" },
++        { name: "Bar", location: { range: barRange }, containerName: "main" },
++      ]
++
++      yield* run({ file, name: "Bar", new_text: "func Bar() int {\n\treturn 200\n}" })
++
++      expect(yield* load(file)).toBe(
++        "package main\n\nfunc Foo() int {\n\treturn 1\n}\n\nfunc Bar() int {\n\treturn 200\n}\n",
++      )
++    }),
++  )
++
++  it.instance("disambiguates same-named symbols by container", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "methods.go")
++      // Two String() methods, one per type; ranges 2..4 and 6..8.
++      const src =
++        "package main\n\nfunc String() int {\n\treturn 1\n}\n\nfunc String() int {\n\treturn 2\n}\n"
++      yield* put(file, src)
++      nextSymbols = [
++        { name: "A", range: { start: { line: 2, character: 0 }, end: { line: 4, character: 1 } }, children: [
++          { name: "String", range: { start: { line: 2, character: 0 }, end: { line: 4, character: 1 } } },
++        ] },
++        { name: "B", range: { start: { line: 6, character: 0 }, end: { line: 8, character: 1 } }, children: [
++          { name: "String", range: { start: { line: 6, character: 0 }, end: { line: 8, character: 1 } } },
++        ] },
++      ]
++
++      yield* run({ file, name: "String", container: "B", new_text: "func String() int {\n\treturn 99\n}" })
++
++      expect(yield* load(file)).toBe(
++        "package main\n\nfunc String() int {\n\treturn 1\n}\n\nfunc String() int {\n\treturn 99\n}\n",
++      )
++    }),
++  )
++
++  it.instance("rejects ambiguous symbols without a container and leaves the file intact", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "dupe.go")
++      yield* put(file, GO_SRC)
++      nextSymbols = [
++        { name: "Foo", range: fooRange },
++        { name: "Foo", range: barRange },
++      ]
++
++      const error = yield* fail({ file, name: "Foo", new_text: "func Foo() int { return 0 }" })
++
++      expect(error.message).toContain("SYMBOL_NOT_UNIQUE")
++      expect(yield* load(file)).toBe(GO_SRC)
++    }),
++  )
++
++  it.instance("reports SYMBOL_NOT_FOUND when the LSP knows no such symbol", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "missing.go")
++      yield* put(file, GO_SRC)
++      nextSymbols = [{ name: "Foo", range: fooRange }]
++
++      const error = yield* fail({ file, name: "Nope", new_text: "x" })
++
++      expect(error.message).toContain("SYMBOL_NOT_FOUND")
++      expect(yield* load(file)).toBe(GO_SRC)
++    }),
++  )
++
++  it.instance("reports LSP_UNAVAILABLE when no client is attached", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "noclient.go")
++      yield* put(file, GO_SRC)
++      nextSymbols = [{ name: "Foo", range: fooRange }]
++      clientsAvailable = false
++
++      const error = yield* fail({ file, name: "Foo", new_text: "func Foo() int { return 0 }" })
++
++      expect(error.message).toContain("LSP_UNAVAILABLE")
++      expect(yield* load(file)).toBe(GO_SRC)
++      clientsAvailable = true
++    }),
++  )
++
++  it.instance("rejects a stale expected_sha256 before touching the file", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "hash.go")
++      yield* put(file, GO_SRC)
++      nextSymbols = [{ name: "Foo", range: fooRange }]
++
++      const error = yield* fail({
++        file,
++        name: "Foo",
++        new_text: "func Foo() int {\n\treturn 100\n}",
++        expected_sha256: sha256("stale contents\n"),
++      })
++
++      expect(error.message).toContain("HASH_MISMATCH")
++      expect(yield* load(file)).toBe(GO_SRC)
++    }),
++  )
++
++  it.instance("rejects empty new_text as NO_CHANGES", () =>
++    Effect.gen(function* () {
++      const dir = (yield* TestInstance).directory
++      const file = path.join(dir, "empty.go")
++      yield* put(file, GO_SRC)
++      nextSymbols = [{ name: "Foo", range: fooRange }]
++
++      const error = yield* fail({ file, name: "Foo", new_text: "" })
++
++      expect(error.message).toContain("NO_CHANGES")
++      expect(yield* load(file)).toBe(GO_SRC)
++    }),
++  )
++})

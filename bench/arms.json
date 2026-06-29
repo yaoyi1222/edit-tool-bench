@@ -1,0 +1,7 @@
+{
+  "legacy": "legacy",
+  "exact": "replace_exact,edit_transaction",
+  "anchor": "replace_exact,replace_by_anchor,insert_by_anchor,edit_transaction",
+  "patch": "apply_unified_patch,edit_transaction",
+  "lsp_symbol": "lsp_symbol,replace_exact,edit_transaction"
+}

@@ -1,0 +1,37 @@
+.env
+
+# Local model/provider configuration and binaries.
+bench/opencode-deepseek.json
+bench/opencode-linux-x64-baseline
+
+# Downloaded/generated benchmark inputs.
+bench/tasks.json
+bench/swe_bench_pro_test.parquet
+bench/raw_sample.jsonl
+bench/SWE-bench_Pro-os/
+
+# Runtime artifacts. These can be large and may contain full agent transcripts.
+runs/
+runs_*/
+remote_snapshot*/
+results/
+
+# Local checkouts/build outputs.
+opencode/
+external/
+node_modules/
+dist/
+build/
+
+# Python.
+.venv/
+bench/.venv/
+__pycache__/
+*.py[cod]
+
+# Misc local files.
+.DS_Store
+*.log
+*.pid
+.codegraph/
+.claude/
